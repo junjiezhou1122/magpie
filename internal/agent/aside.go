@@ -59,7 +59,13 @@ func asideIn(at place) *Agent {
 		return nil
 	}
 	a := &Agent{
-		ID: "aside", Name: "Aside", Icon: "aside", Bin: "aside", Dir: dir, Path: path,
+		ID: "aside", Name: "Aside", Icon: "aside", Bin: "aside", Path: path,
+		// ~/.aside, the folder the installer makes, and not the account's:
+		// ~/.aside/u/0 only appears once someone has signed in, so an Aside
+		// that is installed and not yet used is not detected by it, and the
+		// binary is not a reliable second look (it lands in ~/.local/bin,
+		// which a magpie launched from Finder does not have on its PATH).
+		Dir:    filepath.Join(at.home, ".aside"),
 		Notice: asideNoticeRestart,
 		Check: func() string {
 			onMagpie := strings.HasPrefix(asideModel(path, "defaultModel"), magpieID+"/")

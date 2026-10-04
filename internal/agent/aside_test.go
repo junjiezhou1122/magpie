@@ -297,6 +297,29 @@ func TestAsideEffortIsItsOwnField(t *testing.T) {
 	}
 }
 
+// An Aside that is installed and not yet used has no account folder yet, and
+// the binary is not a second look: its installer puts that in ~/.local/bin,
+// which a magpie launched from Finder has no PATH entry for. The row still has
+// to be there, so it is the folder the installer makes that counts.
+func TestAsideIsDetectedBeforeAnyAccount(t *testing.T) {
+	syncHome(t)
+	// the CLI's installer puts the binary in ~/.local/bin, which a magpie
+	// launched from Finder has no PATH entry for, so the folder is the only
+	// thing left to go on
+	t.Setenv("PATH", t.TempDir())
+	dir := filepath.Join(os.Getenv("HOME"), ".aside", "cli")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a := mustFindAside(t)
+	if !a.Detected() {
+		t.Fatalf("an installed Aside is not detected: dir %q, path %q", a.Dir, a.Path)
+	}
+	if a.Field("model").Get() != "" {
+		t.Fatalf("a model is read out of an account that is not there: %q", a.Field("model").Get())
+	}
+}
+
 // A task role is a model of its own in Aside, unset while it follows the
 // default: setting one writes the whole selection Aside takes — a role is not
 // a pair of keys beside the model — with the thinking level the default is on,
