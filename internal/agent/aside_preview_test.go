@@ -85,7 +85,10 @@ func TestAsideDisconnectDryRunNeverCallsDaemon(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv(dryProvidersVar, held)
-	t.Cleanup(func() { dryProviders = nil })
+	t.Cleanup(func() {
+		dryProviders = nil
+		disconnectDryRun = false
+	})
 	calls := 0
 	asideSet = func(account, expr string) error {
 		calls++
