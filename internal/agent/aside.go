@@ -78,6 +78,9 @@ func asideIn(at place) *Agent {
 					onMagpie = true
 				}
 			}
+			if strings.HasPrefix(asideModel(path, asideImageKey), magpieID+"/") {
+				onMagpie = true
+			}
 			if !onMagpie {
 				return "" // on a model of its own: nothing of magpie's is in the way
 			}
@@ -150,6 +153,44 @@ func asideIn(at place) *Agent {
 					return static(piLevels...)
 				},
 			},
+			{
+				// The model Aside draws with, which is a setting of its own and
+				// not the model it talks: no thinking level or fast mode sits
+				// beside it, and an account that has never picked one has none
+				// at all, so the field is Quiet and takes after the model.
+				Key: "image", Label: "image", Quiet: true, Follows: "model",
+				Get: func() string { return asideModel(path, asideImageKey) },
+				Set: func(v string) error {
+					if v == "" {
+						return asideApplyImage(path, "")
+					}
+					p, m, ok := strings.Cut(v, "/")
+					if !ok || p == "" || m == "" {
+						return fmt.Errorf("expected provider/model, got %q", v)
+					}
+					if p == magpieID {
+						// as for a task role, a model of magpie's needs the
+						// provider block to reach it through, and what it named
+						// before is what taking magpie out puts back
+						was := ""
+						if cur, _ := edit.GetJSON(path, asideImageKey+".provider"); cur != magpieID {
+							was = asideModel(path, asideImageKey)
+						}
+						if err := wire("aside.was.image", was); err != nil {
+							return err
+						}
+					}
+					return asideApplyImage(path, v)
+				},
+				Options: func(map[string]string) []Option {
+					// the whole of the provider list, as for a task role. Which of
+					// Aside's models can draw is the daemon's answer and is in no
+					// file magpie can read, so a model that cannot is offered and
+					// then refused, and the check is what turns that refusal into
+					// the value written for Aside's next start
+					return append(ownOptions(modelsPath, ""), viaMagpie("aside", magpieID+"/")...)
+				},
+			},
 		},
 	}
 	a.Fields = append(a.Fields, asideRoleFields(path, modelsPath, wire)...)
@@ -160,6 +201,11 @@ func asideIn(at place) *Agent {
 // offers in its own settings. Each is its own model in Aside's account, unset
 // while it follows the default model.
 var asideRoles = []string{"fast", "standard", "deep", "visual"}
+
+// asideImageKey is where Aside keeps the model it draws with: its own setting,
+// a provider and a model and nothing else, and no key at all on an account
+// that has never picked one.
+const asideImageKey = "imageGenerationModel"
 
 // asideRoleFields are the role models, as magpie fields: Quiet, so a role the
 // user has not set is not listed as a line of its own, and taking the model
@@ -318,6 +364,33 @@ func asideApplyRole(path, role, v string) error {
 	return asideApply(path, expr, []edit.KV{{Path: "modelCategories." + role, Value: sel}}, nil)
 }
 
+// asideApplyImage points Aside's picture model at a model, or takes it off
+// altogether (v empty), which leaves Aside with none, the same as an account
+// that never picked one. Unlike a task role it is the provider and the model
+// and nothing else, so there is no level of the user's to read and carry over.
+func asideApplyImage(path, v string) error {
+	if v == "" {
+		// null rather than an object with nothing in it: Aside takes either,
+		// and null is the one it had before any of this
+		return asideApply(path,
+			"const after = aside.settings.set('"+asideImageKey+"', null);"+
+				"if (after."+asideImageKey+") throw new Error('Aside kept the image model');",
+			nil, []string{asideImageKey})
+	}
+	p, m, ok := strings.Cut(v, "/")
+	if !ok || p == "" || m == "" {
+		return fmt.Errorf("expected provider/model, got %q", v)
+	}
+	kv := map[string]string{"provider": p, "modelId": m}
+	b, err := json.Marshal(kv)
+	if err != nil {
+		return err
+	}
+	expr := "const after = aside.settings.set('" + asideImageKey + "', " + string(b) + ");" +
+		asideCheck("after."+asideImageKey, kv)
+	return asideApply(path, expr, []edit.KV{{Path: asideImageKey, Value: kv}}, nil)
+}
+
 // asideCheck is the part of an expression that fails the change when the
 // setting that came back is not the one asked for. Aside answers a set with
 // the settings as they now are and drops what it will not take without a word
@@ -427,11 +500,11 @@ func asideNoticeRestart() string {
 }
 
 // asideDefault takes magpie out of Aside: the provider block it wrote goes,
-// and the provider and model the user had before it come back, for the default
-// and for every task role magpie moved. Their thinking level and fast mode are
-// already where they left them — magpie never writes those two keys — so only
-// the model is put back, and a key the user set themselves while magpie was
-// not in it is left alone entirely.
+// and the provider and model the user had before it come back, for the default,
+// for every task role magpie moved and for the picture model. The roles'
+// thinking level and fast mode are already where they left them — magpie never
+// writes those two keys — so only the model is put back, and a key the user set
+// themselves while magpie was not in it is left alone entirely.
 //
 // The provider block goes last: a step that fails on the way out leaves the
 // settings still naming magpie and a provider to reach it through, rather than
@@ -450,6 +523,13 @@ func asideDefault(at place, path, modelsPath string) error {
 		// it: the role goes back to following the default rather than naming a
 		// provider that is no longer there
 		if err := asideApplyRole(path, role, unstash(at.key("aside.was."+role))); err != nil {
+			return err
+		}
+	}
+	if p, _ := edit.GetJSON(path, asideImageKey+".provider"); p == magpieID {
+		// the same for the picture model: an empty was leaves Aside with none,
+		// which is what it had before magpie was in it
+		if err := asideApplyImage(path, unstash(at.key("aside.was.image"))); err != nil {
 			return err
 		}
 	}

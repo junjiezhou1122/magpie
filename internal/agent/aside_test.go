@@ -69,6 +69,18 @@ func asideStandIn(t *testing.T, path string) {
 		if strings.Contains(expr, "delete m.provider; delete m.modelId;") {
 			return edit.DelJSON(path, "defaultModel.provider", "defaultModel.modelId")
 		}
+		if strings.Contains(expr, "aside.settings.set('"+asideImageKey+"', null)") {
+			return edit.DelJSON(path, asideImageKey)
+		}
+		const imageMark = "aside.settings.set('" + asideImageKey + "', "
+		if i := strings.LastIndex(expr, imageMark); i > 0 {
+			sel, _, _ := strings.Cut(expr[i+len(imageMark):], ");")
+			var kv map[string]string
+			if err := json.Unmarshal([]byte(sel), &kv); err != nil {
+				return err
+			}
+			return edit.SetJSON(path, edit.KV{Path: asideImageKey, Value: kv})
+		}
 		if _, after, ok := strings.Cut(expr, `delete c["`); ok {
 			role, _, _ := strings.Cut(after, `"];`)
 			return edit.DelJSON(path, "modelCategories."+role)
@@ -138,6 +150,23 @@ func editAsideCategory(t *testing.T, path, role, sel string) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// asideImage is what Aside holds its picture model as now, whole. A nil map is
+// the key being gone, which is how an account that has never picked one reads.
+func asideImage(t *testing.T, path string) map[string]any {
+	t.Helper()
+	var m struct {
+		Image map[string]any `json:"imageGenerationModel"`
+		Theme string         `json:"theme"`
+	}
+	if err := json.Unmarshal([]byte(readFile(path)), &m); err != nil {
+		t.Fatal(err)
+	}
+	if m.Theme != "dark" {
+		t.Fatalf("Aside's other settings went: %s", readFile(path))
+	}
+	return m.Image
 }
 
 func asideBlock(t *testing.T, path string) map[string]any {
@@ -472,6 +501,109 @@ func TestAsideRoleDefaultFollowsTheDefault(t *testing.T) {
 	}
 	if got := a.Field("standard").Get(); got != "" {
 		t.Fatalf("read back as %q", got)
+	}
+}
+
+// The model Aside draws with is a field of its own, quiet and taking after the
+// model, because most accounts have not picked one.
+func TestAsideImageIsItsOwnField(t *testing.T) {
+	asideHome(t)
+	f := mustFindAside(t).Field("image")
+	if f == nil {
+		t.Fatal("Aside has no image field")
+	}
+	if !f.Quiet || f.Follows != "model" {
+		t.Fatalf("image is not a field that follows the model: quiet %v, follows %q", f.Quiet, f.Follows)
+	}
+}
+
+// Picking a picture model of magpie's goes through Aside, and carries the two
+// keys Aside takes and no others: a thinking level and fast mode belong to the
+// model it talks, and it refuses a value that has them.
+func TestAsideImageGoesThroughAside(t *testing.T) {
+	settings, _ := asideHome(t)
+	seen := ""
+	inner := asideSet
+	asideSet = func(account, expr string) error {
+		seen = expr
+		return inner(account, expr)
+	}
+	t.Cleanup(func() { asideSet = inner })
+	a := mustFindAside(t)
+	if err := a.Apply("image", magpieID+`/x","provider":"someone-else`); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(seen, asideOK) {
+		t.Fatalf("the change went out as %q", seen)
+	}
+	sel := asideImage(t, settings)
+	if len(sel) != 2 || sel["provider"] != magpieID || sel["modelId"] != `x","provider":"someone-else` {
+		t.Fatalf("the image model is not the two keys Aside takes: %v", sel)
+	}
+	if got := a.Field("image").Get(); got != magpieID+`/x","provider":"someone-else` {
+		t.Fatalf("read back as %q", got)
+	}
+}
+
+// Taking magpie out of Aside puts the picture model the user had back, and one
+// of magpie's goes off rather than naming a provider that is no longer there.
+func TestAsideDefaultPutsTheImageModelBack(t *testing.T) {
+	settings, models := asideHome(t)
+	a := mustFindAside(t)
+	if err := a.Apply("image", "native/native-model"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Apply("image", magpieID+"/relay/glm-4.6"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Apply("model", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := asideImage(t, settings); got["provider"] != "native" || got["modelId"] != "native-model" {
+		t.Fatalf("the picture model the user had went: %v", got)
+	}
+	if b := asideBlock(t, models); b != nil {
+		t.Fatalf("magpie's provider is still in Aside's models.json: %v", b)
+	}
+}
+
+// An image model of magpie's that had no picture model behind it leaves Aside
+// with none, which is what it had before, and the key is gone rather than left
+// empty for Aside to read as a model with no name.
+func TestAsideImageWithNothingBehindItGoesOff(t *testing.T) {
+	settings, _ := asideHome(t)
+	a := mustFindAside(t)
+	if err := a.Apply("image", magpieID+"/relay/glm-4.6"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Apply("image", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := asideImage(t, settings); got != nil {
+		t.Fatalf("the picture model is still there: %v", got)
+	}
+	if got := a.Field("image").Get(); got != "" {
+		t.Fatalf("read back as %q", got)
+	}
+}
+
+// A picture model of magpie's is a model of magpie's like any other, so the
+// wiring check covers it: a provider block gone is worth saying so about even
+// though no model of magpie's was left behind to reach through it.
+func TestAsideImageIsWired(t *testing.T) {
+	_, models := asideHome(t)
+	a := mustFindAside(t)
+	if err := a.Apply("image", magpieID+"/relay/glm-4.6"); err != nil {
+		t.Fatal(err)
+	}
+	if n := a.Check(); n != "" {
+		t.Fatalf("a wired picture model is reported as %q", n)
+	}
+	if err := edit.DelJSON(models, "providers."+magpieID); err != nil {
+		t.Fatal(err)
+	}
+	if n := a.Check(); n == "" {
+		t.Fatal("a picture model on magpie with no provider block is not noticed")
 	}
 }
 
