@@ -5,9 +5,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
@@ -63,6 +65,9 @@ func asideStandIn(t *testing.T, path string) {
 				return err
 			}
 			return edit.SetJSON(path, edit.KV{Path: "modelCategories." + role, Value: sel})
+		}
+		if strings.Contains(expr, "delete m.provider; delete m.modelId;") {
+			return edit.DelJSON(path, "defaultModel.provider", "defaultModel.modelId")
 		}
 		if _, after, ok := strings.Cut(expr, `delete c["`); ok {
 			role, _, _ := strings.Cut(after, `"];`)
@@ -591,6 +596,122 @@ func TestAsideChecksWhatCameBack(t *testing.T) {
 	}
 	if !strings.Contains(seen, `after.defaultModel.modelId !== "relay/glm-4.6"`) {
 		t.Fatalf("the change is not checked against what came back: %q", seen)
+	}
+}
+
+// A repl that never answers must not leave a pick hanging: the change waits
+// about ten seconds and is then written to the file, which is what Aside
+// reads at its next start, and the user is told so. This drives the real
+// command, against an aside that hangs.
+func TestAsideGivesUpOnAReplThatHangs(t *testing.T) {
+	settings, _ := asideHome(t)
+	// a shell builtin loop, not sleep: the PATH here is only the folder the
+	// stand-in is in, so there is no sleep to be found
+	hangingAside(t, "while :; do :; done")
+	// TestMain stands in for the binary; a test that hangs has to run the real one
+	real := asideRealSet
+	asideSet = real
+	t.Cleanup(func() { asideSet = func(string, string) error { return errors.New("aside: no Aside in a test") } })
+
+	was := asideTimeout
+	asideTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { asideTimeout = was })
+
+	a := mustFindAside(t)
+	start := time.Now()
+	if err := a.Apply("model", magpieID+"/relay/glm-4.6"); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	if elapsed > 5*time.Second {
+		t.Fatalf("a change waited %s on a repl that never answered", elapsed)
+	}
+	if dm := asideSettings(t, settings); dm["provider"] != magpieID {
+		t.Fatalf("a change Aside could not be asked for is not in the file: %v", dm)
+	}
+	if a.Notice() == "" {
+		t.Fatal("a change that only takes hold at Aside's next start says nothing about it")
+	}
+}
+
+// asideRealSet is the command as it runs, kept beside the stand-in the package
+// tests with, for a test that needs the process itself.
+var asideRealSet = asideSet
+
+// hangingAside puts an aside on PATH that runs body and never gets on with it.
+func hangingAside(t *testing.T, body string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("a shell script is not an exe")
+	}
+	dir := t.TempDir()
+	aside := filepath.Join(dir, "aside")
+	if err := os.WriteFile(aside, []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+}
+
+// Switching off with no model of the user's behind magpie's takes the model
+// off through Aside, not through the file: the daemon is still on the model,
+// and reading the file behind it leaves it naming a provider that is on its
+// way out.
+func TestAsideDefaultWithNothingSavedGoesThroughAside(t *testing.T) {
+	settings, _ := asideHome(t)
+	inner := asideSet
+	var seen []string
+	asideSet = func(account, expr string) error {
+		seen = append(seen, expr)
+		return inner(account, expr)
+	}
+	t.Cleanup(func() { asideSet = inner })
+	a := mustFindAside(t)
+	if err := a.Apply("model", magpieID+"/relay/glm-4.6"); err != nil {
+		t.Fatal(err)
+	}
+	forget("aside.was") // nothing of the user's behind it
+	if err := a.Apply("model", ""); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(seen, "\n")
+	if !strings.Contains(joined, "delete m.provider") {
+		t.Fatalf("taking the model off went around Aside: %v", seen)
+	}
+	if dm := asideSettings(t, settings); dm["provider"] != nil && dm["provider"] != "" {
+		t.Fatalf("the model is still named: %v", dm)
+	}
+}
+
+// The provider block goes last on the way out: while the settings are still
+// being changed, the provider to reach magpie's models through has to be
+// there, or a step that fails on the way leaves the settings naming one that
+// is gone.
+func TestAsideDefaultTakesTheProviderOutLast(t *testing.T) {
+	_, models := asideHome(t)
+	a := mustFindAside(t)
+	if err := a.Apply("model", magpieID+"/relay/glm-4.6"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Apply("fast", magpieID+"/relay/glm-4.6"); err != nil {
+		t.Fatal(err)
+	}
+	inner := asideSet
+	var goneBefore bool
+	asideSet = func(account, expr string) error {
+		if _, ok := edit.GetJSON(models, "providers."+magpieID); !ok {
+			goneBefore = true
+		}
+		return inner(account, expr)
+	}
+	t.Cleanup(func() { asideSet = inner })
+	if err := a.Apply("model", ""); err != nil {
+		t.Fatal(err)
+	}
+	if goneBefore {
+		t.Fatal("the provider was taken out before the settings were changed")
+	}
+	if b := asideBlock(t, models); b != nil {
+		t.Fatal("the provider was not taken out at all")
 	}
 }
 

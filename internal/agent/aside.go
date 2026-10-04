@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	syncatomic "sync/atomic"
+	"time"
 
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
@@ -233,11 +235,21 @@ func asideModel(path, key string) string {
 // API, which applies it at once and leaves the same file behind. The API is
 // reached through the repl: the settings command has no set of its own.
 var asideSet = func(account, expr string) error {
-	out, err := proc.Command("aside", "repl", "--account", account, expr).Output()
+	// a repl that hangs, on a daemon that has wedged or one waiting on input,
+	// would leave a pick in the Agents page or the CLI hanging on it, and
+	// switching off asks up to five times over (the default and four roles):
+	// the daemon's own reply is near-instant, so a tenth of a second is a
+	// long wait for a change that is about to be written to the file anyway
+	ctx, cancel := context.WithTimeout(context.Background(), asideTimeout)
+	defer cancel()
+	out, err := proc.CommandContext(ctx, "aside", "repl", "--account", account, expr).Output()
 	if err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
 			return fmt.Errorf("aside: %s", bytes.TrimSpace(ee.Stderr))
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("aside: the repl did not answer in %s", asideTimeout)
 		}
 		return err
 	}
@@ -246,6 +258,11 @@ var asideSet = func(account, expr string) error {
 	}
 	return nil
 }
+
+// asideTimeout is how long a change waits for Aside itself before it is
+// written to the file, which is what Aside reads at its next start. A var so
+// a test can drive the real command against a repl that never answers.
+var asideTimeout = 10 * time.Second
 
 // asideOK is what the repl prints once the setting is in, so a run that
 // answered something else is not taken for one that wrote.
@@ -374,17 +391,25 @@ func jsString(s string) string {
 	return string(b)
 }
 
-// asideClearDefault takes the keys out of Aside's default, or puts them back
-// to was, the same way asideApplyDefault does.
+// asideClearDefault takes the model out of Aside's default, or puts back to
+// was the one the user had, the same way asideApplyDefault does. Both go
+// through Aside: the file is what the daemon has already stopped reading.
 func asideClearDefault(path, was string) error {
 	kv := map[string]string{}
 	if p, m, ok := strings.Cut(was, "/"); ok && p != "" && m != "" {
 		kv["provider"], kv["modelId"] = p, m
 	}
 	if len(kv) == 0 {
-		// no default of magpie's to put back, and a default the user set
-		// themselves is not ours to take apart: only the model comes off
-		return edit.DelJSON(path, "defaultModel.provider", "defaultModel.modelId")
+		// there is no model of the user's behind this one, so the model comes
+		// off and the default is left as Aside makes one for itself. Through
+		// Aside and not the file, or the daemon goes on running the model of
+		// a provider that is about to be taken out from under it.
+		return asideApply(path,
+			"const m = aside.settings.get('defaultModel') || {}; delete m.provider; delete m.modelId;"+
+				"const after = aside.settings.set('defaultModel', m);"+
+				"if (after.defaultModel && (after.defaultModel.provider || after.defaultModel.modelId)) "+
+				"throw new Error('Aside kept the model');",
+			nil, []string{"defaultModel.provider", "defaultModel.modelId"})
 	}
 	return asideApplyDefault(path, kv)
 }
@@ -407,10 +432,11 @@ func asideNoticeRestart() string {
 // already where they left them — magpie never writes those two keys — so only
 // the model is put back, and a key the user set themselves while magpie was
 // not in it is left alone entirely.
+//
+// The provider block goes last: a step that fails on the way out leaves the
+// settings still naming magpie and a provider to reach it through, rather than
+// naming a provider that is no longer there.
 func asideDefault(at place, path, modelsPath string) error {
-	if err := edit.DelJSON(modelsPath, "providers."+magpieID); err != nil {
-		return err
-	}
 	if cur, _ := edit.GetJSON(path, "defaultModel.provider"); cur == magpieID {
 		if err := asideClearDefault(path, unstash(at.key("aside.was"))); err != nil {
 			return err
@@ -427,5 +453,5 @@ func asideDefault(at place, path, modelsPath string) error {
 			return err
 		}
 	}
-	return nil
+	return edit.DelJSON(modelsPath, "providers."+magpieID)
 }
