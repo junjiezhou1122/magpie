@@ -1238,7 +1238,17 @@ function connectPanel(a, { fields, fieldBtn }) {
   // what a new session starts on: optional, the agent's own last pick
   // unset; Codex's is the very value its /model picks, so one choice
   // the model it starts on is on the row; what goes with it here
-  if (fields) kv(t("New sessions"), line(fields));
+  if (fields) {
+    // each setting named, as the tray panel's opened rows name them. On the
+    // row a setting nobody has picked is the agent's own logo for want of
+    // room, which says nothing about which setting it is, and four of them
+    // laid side by side all read as one
+    for (const b of fields.querySelectorAll(":scope > .field")) {
+      const f = a.fields.find((x) => x.key === b.dataset.key);
+      if (f && !b.querySelector(":scope > .k")) b.prepend(el("span", "k", t(f.label)));
+    }
+    kv(t("New sessions"), line(fields));
+  }
   if (CONNECT_COST[a.id]) kv(t("Once connected"), line(t(CONNECT_COST[a.id])));
   if (a.launch) {
     const cp = el("button", "ag-quiet", t("Copy"));

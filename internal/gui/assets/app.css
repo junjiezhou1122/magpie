@@ -1156,7 +1156,9 @@ body.panel { --row-spring: cubic-bezier(.25, .3, .1, 1); }
 .ag-open .field { display: flex; justify-content: flex-start; width: 100%; height: 30px; gap: 8px; padding: 0 10px; border-radius: 8px; background: var(--card); font-size: 12.5px; box-shadow: inset 0 0 0 1px var(--pill-line); }
 body.panel .ag-open .field:hover { background: var(--card); box-shadow: inset 0 0 0 1px var(--pill-line), var(--pill-shadow); }
 body.panel .ag-open .field.open { box-shadow: inset 0 0 0 1px var(--accent); }
-.ag-open .field .k { order: 0; width: 44px; text-align: left; font-size: 11px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* wide enough for the longest name an agent's own settings go by
+   (Aside's standard, Claude Code's thinking), which 44px cut to stand... */
+.ag-open .field .k { order: 0; width: 62px; text-align: left; font-size: 11px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ag-open .field .v { order: 1; flex: 1 1 auto; font-weight: 400; text-align: left; }
 .ag-open .field > .ic, .ag-open .field > .ic-stack { order: 2; flex: none; }
 .row.agent .ag-open .field .ic { width: 14px; height: 14px; }
@@ -2795,6 +2797,13 @@ body.window .row + .row.agent.conn > .who { min-height: 41px; } /* the line abov
 .ag-v { flex: 1; min-width: 0; font-size: 12.5px; color: var(--fg-2); display: grid; gap: 4px; }
 .ag-vl { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; min-height: 24px; }
 .ag-vl > .fields { margin-left: 0; }
+/* the opened row has the whole width under the name to lay its settings out
+   in, so they are a line of pills that wraps rather than the shut row's two
+   narrow columns: a name, a model and a logo do not go into 124px. #agents for
+   the extras width the shut row's own rule sets on the id. */
+#agents .ag-exp .ag-vl > .fields { display: flex; flex-wrap: wrap; width: 100%; gap: 6px; }
+#agents .ag-exp .ag-vl > .fields > .field { flex: 0 1 auto; min-width: 170px; }
+#agents .ag-exp .ag-vl > .fields > .extras-cell { justify-content: flex-start; flex-wrap: wrap; }
 .ag-code, .ag-diff code, .ag-path { font-family: var(--code); font-size: 11.5px; }
 .ag-code { padding: 1px 5px; border-radius: 4px; background: var(--pill); color: var(--fg); }
 .ag-warn { gap: 8px; font-size: 12px; }
