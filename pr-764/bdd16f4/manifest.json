@@ -1,0 +1,24 @@
+{
+  "summary": "这次改动只动 macOS 的窗口外壳：主窗口进入全屏时 magpie 会临时留在 Dock（Dock 设为「隐藏」时也一样），退出全屏后按 Dock 设置恢复，于是全屏时窗口标题栏连同三个窗口按钮会随菜单栏一起出现。网页界面（HTML/CSS/文本）本身没有任何变化。",
+  "scenes": [
+    {
+      "title": "改动作用的主窗口",
+      "shots": [
+        {
+          "file": "01-main-window.png",
+          "caption": "magpie 主窗口：本次改动只影响 macOS 的外壳——它的全屏标题栏与 Dock 图标，网页里看不到差别",
+          "width": 2560
+        }
+      ]
+    }
+  ],
+  "video": null,
+  "poster": null,
+  "errors": [],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "沙盒把 magpie 渲染成浏览器里的网页（1280x800）：看不到 macOS 的 Dock、菜单栏和窗口标题栏；进入全屏只能靠原生菜单 View › Toggle Full Screen 或绿灯按钮，改 Dock 设置也只能在 macOS 的「系统设置 / Dock 菜单」里，页面上没有对应的开关。因此「Dock 设为隐藏时，全屏仍有 Dock 图标和标题栏按钮、退出全屏后又消失」这一效果无法在录屏里复现，只能展示改动所作用的那扇窗口本身。",
+  "interactive": false,
+  "pages": 1
+}

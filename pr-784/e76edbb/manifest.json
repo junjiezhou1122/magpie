@@ -1,0 +1,67 @@
+{
+  "summary": "「用量 › 请求」和「路由」两页各新增了一个「调用用途」筛选（把 agent 记录的各种 kind 归并成统一用途，如未标记、标题、子代理等）来过滤请求；路由页的统计、失败请求入口和最新请求故事也改为跟随所选用途，未筛选时仍显示网关累计值。用途目录改由 usage.PurposeKinds 生成 purposes.js。",
+  "scenes": [
+    {
+      "title": "路由页的用途筛选与统计",
+      "shots": [
+        {
+          "file": "01-routing-stats-unfiltered.png",
+          "caption": "路由页打开时的统计（未筛选）",
+          "width": 2560
+        },
+        {
+          "file": "02-routing-filters-row.png",
+          "caption": "请求列表上方的筛选行",
+          "width": 1328
+        },
+        {
+          "file": "03-routing-requests.png",
+          "caption": "网关保留的最近 3 个请求",
+          "width": 2560
+        },
+        {
+          "file": "04-routing-day-requests.png",
+          "caption": "「今天」这一天留下的请求",
+          "width": 2560
+        },
+        {
+          "file": "05-routing-day-stats.png",
+          "caption": "这一天视图下的统计与最近一个请求",
+          "width": 2560
+        }
+      ]
+    },
+    {
+      "title": "用量页按用途筛选请求",
+      "shots": [
+        {
+          "file": "06-usage-purpose-picker.png",
+          "caption": "请求列表上方新增的「调用用途」",
+          "width": 2560
+        },
+        {
+          "file": "07-usage-filters-row.png",
+          "caption": "请求列表上方的筛选控件",
+          "width": 2560
+        },
+        {
+          "file": "08-usage-request-list.png",
+          "caption": "按「今天」列出的请求列表",
+          "width": 2560
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [
+    "路由页的用途筛选与统计 · scroll : nothing visible matches #rtPurpose (1 in the page)",
+    "用量页按用途筛选请求 · click #ledPurpose: nothing visible matches #ledPurpose (1 in the page)"
+  ],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "沙盒里只有 DeepSeek 和几条 curl 发出的普通对话请求：它们没有记录 kind，也没有失败请求，所以「全部用途／未标记」以外的命名用途（标题、子代理、审批检查等）筛选、失败请求入口可点与不可点的对比、按用途跟踪新的实时请求、离开再返回页面后保持所选用途、以及历史某天筛不到请求的空状态，在这个环境里都不会出现。",
+  "interactive": true,
+  "pages": 2
+}

@@ -1,0 +1,54 @@
+{
+  "summary": "routing.js 把「一条请求算不算失败」从只看状态码改成看整条请求：状态 200 但已开始回答随后中断（try 带 fail）的请求现在按失败处理——路由页的行不再显示成绿色应答、替换/改道标记只在 tryOk 的 try 上出现、错误统计的点击能挑中它、请求日志和两处重放动画（页面与 Agents 面板）也按同一条规则走。",
+  "scenes": [
+    {
+      "title": "路由页：请求列表与错误统计",
+      "shots": [
+        {
+          "file": "01-routing-top.png",
+          "caption": "路由页：最近一个请求的日志与统计",
+          "width": 2560
+        },
+        {
+          "file": "02-request-list.png",
+          "caption": "网关保留的最近几个请求",
+          "width": 1328
+        },
+        {
+          "file": "03-errors-stat-clicked.png",
+          "caption": "点击统计之后的统计栏与列表",
+          "width": 1120
+        },
+        {
+          "file": "04-request-story.png",
+          "caption": "该请求的日志",
+          "width": 2524
+        }
+      ]
+    },
+    {
+      "title": "重放动画",
+      "shots": [
+        {
+          "file": "05-replay-stage.png",
+          "caption": "重放动画中的请求流向",
+          "width": 2524
+        },
+        {
+          "file": "06-replay-done.png",
+          "caption": "重放结束后同一条请求的日志与统计",
+          "width": 2560
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "沙盒里只有正常完成的 DeepSeek 请求，没有「已开始回答随后中断」（状态 200 却带 fail）的请求，所以看不到行从绿色变红、错误统计点开后挑中它、重放动画把它判成失败；要看出差别需要有这样一条中断请求的数据。",
+  "interactive": true,
+  "pages": 1
+}

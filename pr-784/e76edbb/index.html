@@ -1,0 +1,19 @@
+<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>#784 界面预览 · e76edbb</title>
+<style>:root{color-scheme:light dark;--bg:#f6f6f7;--fg:#1d1d1f;--muted:#6e6e73;--card:#fff;--line:#e5e5ea}
+@media (prefers-color-scheme:dark){:root{--bg:#111113;--fg:#f2f2f4;--muted:#9a9aa0;--card:#1c1c1f;--line:#2c2c30}}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,"Segoe UI","PingFang SC","Noto Sans CJK SC",sans-serif}
+main{max-width:1100px;margin:0 auto;padding:28px 16px 60px}h1{font-size:20px;margin:0 0 4px}.m{color:var(--muted);font-size:13px;margin:0 0 20px}
+video,img{display:block;width:100%;border-radius:10px;border:1px solid var(--line);background:var(--card)}figure{margin:0 0 28px}figcaption{color:var(--muted);font-size:13px;margin-top:8px}
+a{color:inherit}</style>
+<main><h1>#784 界面预览</h1><p class="m">commit e76edbb · <a href="https://github.com/yetone/magpie/pull/784">回到 PR</a> · 「用量 › 请求」和「路由」两页各新增了一个「调用用途」筛选（把 agent 记录的各种 kind 归并成统一用途，如未标记、标题、子代理等）来过滤请求；路由页的统计、失败请求入口和最新请求故事也改为跟随所选用途，未筛选时仍显示网关累计值。用途目录改由 usage.PurposeKinds 生成 purposes.js。</p>
+<figure><video src="preview.mp4" controls autoplay muted playsinline poster="poster.png"></video><figcaption>红线是鼠标走过的轨迹，红色圆环是一次点击；底部文字是这一步在做什么。空格暂停，← → 逐段查看。</figcaption></figure>
+<figure><img src="01-routing-stats-unfiltered.png" alt="路由页打开时的统计（未筛选）"><figcaption>路由页的用途筛选与统计 · 路由页打开时的统计（未筛选）</figcaption></figure>
+<figure><img src="02-routing-filters-row.png" alt="请求列表上方的筛选行"><figcaption>路由页的用途筛选与统计 · 请求列表上方的筛选行</figcaption></figure>
+<figure><img src="03-routing-requests.png" alt="网关保留的最近 3 个请求"><figcaption>路由页的用途筛选与统计 · 网关保留的最近 3 个请求</figcaption></figure>
+<figure><img src="04-routing-day-requests.png" alt="「今天」这一天留下的请求"><figcaption>路由页的用途筛选与统计 · 「今天」这一天留下的请求</figcaption></figure>
+<figure><img src="05-routing-day-stats.png" alt="这一天视图下的统计与最近一个请求"><figcaption>路由页的用途筛选与统计 · 这一天视图下的统计与最近一个请求</figcaption></figure>
+<figure><img src="06-usage-purpose-picker.png" alt="请求列表上方新增的「调用用途」"><figcaption>用量页按用途筛选请求 · 请求列表上方新增的「调用用途」</figcaption></figure>
+<figure><img src="07-usage-filters-row.png" alt="请求列表上方的筛选控件"><figcaption>用量页按用途筛选请求 · 请求列表上方的筛选控件</figcaption></figure>
+<figure><img src="08-usage-request-list.png" alt="按「今天」列出的请求列表"><figcaption>用量页按用途筛选请求 · 按「今天」列出的请求列表</figcaption></figure>
+</main></html>

@@ -1,0 +1,15 @@
+<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>#770 界面预览 · cd8494d</title>
+<style>:root{color-scheme:light dark;--bg:#f6f6f7;--fg:#1d1d1f;--muted:#6e6e73;--card:#fff;--line:#e5e5ea}
+@media (prefers-color-scheme:dark){:root{--bg:#111113;--fg:#f2f2f4;--muted:#9a9aa0;--card:#1c1c1f;--line:#2c2c30}}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,"Segoe UI","PingFang SC","Noto Sans CJK SC",sans-serif}
+main{max-width:1100px;margin:0 auto;padding:28px 16px 60px}h1{font-size:20px;margin:0 0 4px}.m{color:var(--muted);font-size:13px;margin:0 0 20px}
+video,img{display:block;width:100%;border-radius:10px;border:1px solid var(--line);background:var(--card)}figure{margin:0 0 28px}figcaption{color:var(--muted);font-size:13px;margin-top:8px}
+a{color:inherit}</style>
+<main><h1>#770 界面预览</h1><p class="m">commit cd8494d · <a href="https://github.com/yetone/magpie/pull/770">回到 PR</a> · 设置 → 语言的选项里新增「Deutsch」，并补上完整的德语词条；切到德语后导航、文案以及日期/数字（改走新的 localeTag()）都随语言变化。其余改动（HOME/XDG 等环境变量与 APPIMAGE 的路径防护、测试与脚本加固）只在启动和脚本层面，没有界面表现。</p>
+<figure><video src="preview.mp4" controls autoplay muted playsinline poster="poster.png"></video><figcaption>红线是鼠标走过的轨迹，红色圆环是一次点击；底部文字是这一步在做什么。空格暂停，← → 逐段查看。</figcaption></figure>
+<figure><img src="01-language-row-before.png" alt="设置 → 常规：「语言」一行"><figcaption>语言设置里的 Deutsch · 设置 → 常规：「语言」一行</figcaption></figure>
+<figure><img src="02-settings-after-deutsch.png" alt="点击「Deutsch」后的设置页"><figcaption>语言设置里的 Deutsch · 点击「Deutsch」后的设置页</figcaption></figure>
+<figure><img src="03-usage-deutsch.png" alt="「用量」页：额度、数字与时间"><figcaption>德语界面下的用量与网关 · 「用量」页：额度、数字与时间</figcaption></figure>
+<figure><img src="04-gateway-deutsch.png" alt="「网关」页的界面文案"><figcaption>德语界面下的用量与网关 · 「网关」页的界面文案</figcaption></figure>
+</main></html>

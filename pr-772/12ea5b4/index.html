@@ -1,0 +1,17 @@
+<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>#772 界面预览 · 12ea5b4</title>
+<style>:root{color-scheme:light dark;--bg:#f6f6f7;--fg:#1d1d1f;--muted:#6e6e73;--card:#fff;--line:#e5e5ea}
+@media (prefers-color-scheme:dark){:root{--bg:#111113;--fg:#f2f2f4;--muted:#9a9aa0;--card:#1c1c1f;--line:#2c2c30}}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,"Segoe UI","PingFang SC","Noto Sans CJK SC",sans-serif}
+main{max-width:1100px;margin:0 auto;padding:28px 16px 60px}h1{font-size:20px;margin:0 0 4px}.m{color:var(--muted);font-size:13px;margin:0 0 20px}
+video,img{display:block;width:100%;border-radius:10px;border:1px solid var(--line);background:var(--card)}figure{margin:0 0 28px}figcaption{color:var(--muted);font-size:13px;margin-top:8px}
+a{color:inherit}</style>
+<main><h1>#772 界面预览</h1><p class="m">commit 12ea5b4 · <a href="https://github.com/yetone/magpie/pull/772">回到 PR</a> · routing.js 把「一条请求算不算失败」从只看状态码改成看整条请求：状态 200 但已开始回答随后中断（try 带 fail）的请求现在按失败处理——路由页的行不再显示成绿色应答、替换/改道标记只在 tryOk 的 try 上出现、错误统计的点击能挑中它、请求日志和两处重放动画（页面与 Agents 面板）也按同一条规则走。</p>
+<figure><video src="preview.mp4" controls autoplay muted playsinline poster="poster.png"></video><figcaption>红线是鼠标走过的轨迹，红色圆环是一次点击；底部文字是这一步在做什么。空格暂停，← → 逐段查看。</figcaption></figure>
+<figure><img src="01-routing-top.png" alt="路由页：最近一个请求的日志与统计"><figcaption>路由页：请求列表与错误统计 · 路由页：最近一个请求的日志与统计</figcaption></figure>
+<figure><img src="02-request-list.png" alt="网关保留的最近几个请求"><figcaption>路由页：请求列表与错误统计 · 网关保留的最近几个请求</figcaption></figure>
+<figure><img src="03-errors-stat-clicked.png" alt="点击统计之后的统计栏与列表"><figcaption>路由页：请求列表与错误统计 · 点击统计之后的统计栏与列表</figcaption></figure>
+<figure><img src="04-request-story.png" alt="该请求的日志"><figcaption>路由页：请求列表与错误统计 · 该请求的日志</figcaption></figure>
+<figure><img src="05-replay-stage.png" alt="重放动画中的请求流向"><figcaption>重放动画 · 重放动画中的请求流向</figcaption></figure>
+<figure><img src="06-replay-done.png" alt="重放结束后同一条请求的日志与统计"><figcaption>重放动画 · 重放结束后同一条请求的日志与统计</figcaption></figure>
+</main></html>

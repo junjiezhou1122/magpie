@@ -1,0 +1,44 @@
+{
+  "summary": "设置 → 语言的选项里新增「Deutsch」，并补上完整的德语词条；切到德语后导航、文案以及日期/数字（改走新的 localeTag()）都随语言变化。其余改动（HOME/XDG 等环境变量与 APPIMAGE 的路径防护、测试与脚本加固）只在启动和脚本层面，没有界面表现。",
+  "scenes": [
+    {
+      "title": "语言设置里的 Deutsch",
+      "shots": [
+        {
+          "file": "01-language-row-before.png",
+          "caption": "设置 → 常规：「语言」一行",
+          "width": 1120
+        },
+        {
+          "file": "02-settings-after-deutsch.png",
+          "caption": "点击「Deutsch」后的设置页",
+          "width": 2560
+        }
+      ]
+    },
+    {
+      "title": "德语界面下的用量与网关",
+      "shots": [
+        {
+          "file": "03-usage-deutsch.png",
+          "caption": "「用量」页：额度、数字与时间",
+          "width": 2560
+        },
+        {
+          "file": "04-gateway-deutsch.png",
+          "caption": "「网关」页的界面文案",
+          "width": 2560
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "托盘菜单与额度通知里的德语（traymenu.go、quota_alert.go）、网站 /de/ 首页及其语言菜单入口，以及「跟随系统」在德语系统上自动选德语：这些都不在这个浏览器预览的应用界面里，无法触发；路径防护（HOME 不可用时拒绝启动、忽略相对 XDG/agent 变量、APPIMAGE 只在 APPDIR 内生效）是启动行为，本沙盒 HOME 正常，界面上看不到。",
+  "interactive": true,
+  "pages": 3
+}
