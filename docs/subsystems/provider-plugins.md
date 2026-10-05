@@ -43,7 +43,7 @@ The editor's "Move to plugin" action calls `provider.Adopt`. With accounts, adop
 
 Installing the plugin independently can also hand over ownership through `provider.HandOver`. The package must be enabled, meet the mover's minimum version, and serve the expected provider. After add, update, or upgrade, the GUI calls `HandOver(ctx, false)`, which can adopt a built-in with no accounts. Existing built-in accounts wait for `HandOver(ctx, true)` in gateway maintenance.
 
-`KeepRetiringMoved` first runs after 20 seconds, then hourly. It maintains moved plugin versions and performs automatic handover. Handover preserves a plugin already signed in under its separate `-plugin` id and skips existing migration records except a `failed` record old enough to retry.
+`KeepRetiringMoved` first runs after 20 seconds, then hourly. Each cycle maintains moved plugin versions, calls `MoveRetiring`, then performs automatic handover. `MoveRetiring` moves subscriptions listed in `provider.Retiring` that have built-in accounts, preserving move-back choices and waiting six hours after a failed attempt. That list is currently empty. Handover preserves a plugin already signed in under its separate `-plugin` id and skips existing migration records except a `failed` record old enough to retry.
 
 `MoveBack` restores built-in ownership and records `back`. Compatible accounts added through the plugin can return too; incompatible accounts can remain with the plugin under its separate id. Removing or disabling a plugin first moves affected built-ins back and stops if that fails. A package installed by the user remains after moving back; a migration-installed package is removed only when no remaining signed-in or moved provider needs it.
 
@@ -67,11 +67,17 @@ The GUI's plugin integration includes `subOf`, `pluginSubs`, and `startPluginSig
 
 Gateway parity tests in [`plugin_parity_test.go`](../../internal/gateway/plugin_parity_test.go) and other `plugin_*_test.go` files compare or exercise plugin paths. A built-in test alone does not establish moved-user behavior. Inspect each test's fixture to confirm that it covers the provider and operation being changed.
 
-Run the relevant package tests with an isolated home directory:
+Run the relevant package tests with an isolated home directory. Resolve Go's caches before changing HOME, so repeated runs reuse them. The subshell cleans up its temporary home on exit, including when tests fail, and returns the test command's exit status.
 
 ```sh
-verification_home=$(mktemp -d)
-HOME="$verification_home" go test -tags nogui ./internal/provider ./internal/gateway ./internal/plugin
+(
+	verification_home=$(mktemp -d) || exit
+	trap 'rm -rf "$verification_home"' EXIT
+	verification_modcache=$(go env GOMODCACHE) || exit
+	verification_buildcache=$(go env GOCACHE) || exit
+	HOME="$verification_home" GOMODCACHE="$verification_modcache" GOCACHE="$verification_buildcache" \
+		go test -tags nogui ./internal/provider ./internal/gateway ./internal/plugin
+)
 ```
 
 Some migration and gateway plugin tests require Bun on PATH and use local plugin fixtures; they skip when Bun is unavailable. Report any skipped tests and verify the community package separately when its implementation changes.
