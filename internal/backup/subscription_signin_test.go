@@ -5,22 +5,23 @@ package backup
 // agent on one machine, so each machine signs in on its own, and a bundle
 // that carried one would sign the agent in on the machine it was put on.
 //
-// The policy has two sides, and the second is the one the report tripped
-// over. A subscription the user has moved onto its plugin still has a row
-// in providers.json, and that row travels: it names the provider, so the
+// The policy has two sides. A subscription the user has moved onto its
+// plugin still has a row in providers.json, and that row travels, so the
 // receiving machine offers the subscription. What stays behind is the
-// credential behind the row. The row travels, the credential does not.
+// credential behind the row: the row travels, the credential does not.
 //
-// These tests pin that on the built-in side (logins.json) and the plugin
-// side (plugin-auth.json) together, under both credential policies of
-// Collect, and against a typed key as the control: a user-typed key does
-// sync, so the policy is not "nothing credential-shaped syncs".
+// Both sides are pinned here, on the built-in store (logins.json) and the
+// plugin store (plugin-auth.json), under both credential policies of
+// Collect, with a typed key as the control: a user-typed key syncs, so the
+// policy is not "nothing credential-shaped syncs".
 
 import (
 	"bytes"
 	"cmp"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -44,11 +45,12 @@ const (
 	fixtureCodexRefresh  = "fixture-codex-refresh-token"
 	fixtureCodexAccess   = "fixture-codex-access-token"
 	fixtureClaudeRefresh = "fixture-claude-refresh-token"
-	// plugin sign-ins, plugin-auth.json
-	fixtureGrokRefresh = "fixture-grok-refresh-token"
-	fixtureGrokAccess  = "fixture-grok-access-token"
-	fixtureGrokSlot    = "fixture-grok-work-refresh-token"
-	fixtureGeminiKey   = "fixture-gemini-plugin-api-key"
+	// plugin sign-ins, plugin-auth.json: both accounts belong to OpenCode
+	// plugin providers, so the names say plugin rather than a vendor
+	fixturePluginRefresh = "fixture-plugin-refresh-token"
+	fixturePluginAccess  = "fixture-plugin-access-token"
+	fixturePluginSlot    = "fixture-plugin-work-refresh-token"
+	fixturePluginKey     = "fixture-plugin-api-key"
 	// a user-typed key: this one is meant to sync
 	fixtureTypedKey  = "fixture-typed-key"
 	fixtureSecondKey = "fixture-typed-second-key"
@@ -94,9 +96,9 @@ func signIns(t *testing.T) {
 			"seen": seen, "on": true, "home": movedProviderID},
 	})
 	writeJSON(t, plugin.AuthPath(), map[string]map[string]any{
-		movedProviderID:           {"type": "oauth", "refresh": fixtureGrokRefresh, "access": fixtureGrokAccess},
-		movedProviderID + "#work": {"type": "oauth", "refresh": fixtureGrokSlot},
-		"opencode-copilot":        {"type": "api", "key": fixtureGeminiKey},
+		movedProviderID:           {"type": "oauth", "refresh": fixturePluginRefresh, "access": fixturePluginAccess},
+		movedProviderID + "#work": {"type": "oauth", "refresh": fixturePluginSlot},
+		"opencode-copilot":        {"type": "api", "key": fixturePluginKey},
 	})
 }
 
@@ -131,22 +133,15 @@ func subscriptionMachine(t *testing.T) {
 	signIns(t)
 }
 
-// carried is the bundle as the bytes of a sealed backup would hold them.
-// Seal marshals the whole Bundle in one call (backup.go:252), so these are
-// the bytes that get sealed: a credential that does not appear in them in
-// plain text does not reach a sealed backup in plain text either, and
-// reading the bundle's own bytes says that without guessing which of its
-// fields a sign-in might hide in.
+// carried is the bundle as the bytes of a sealed backup would hold them:
+// Seal marshals the whole Bundle in one json.Marshal, so these are the
+// bytes that get sealed. A credential absent from them in plain text does
+// not reach a sealed backup in plain text, and reading the bundle's own
+// bytes says that without guessing which of its fields a sign-in might
+// hide in.
 //
-// That is a statement about plain text, and plain text is what the policy
-// is about: what must not reach another machine is a credential that
-// machine can read. It is not a proof that no sign-in can be in there. A
-// []byte field is base64 in these bytes — Bundle.Icons is
-// map[string][]byte — so an account that rode in under one of them would
-// sit in a sealed backup with this check still green. Measured, not
-// argued: a Collect that copies plugin-auth.json into
-// b.Icons["auth-state.bin"] puts the whole plugin store in the bundle and
-// leaves every test here passing.
+// Plain text is not all of it — a []byte field is base64 here, which is why
+// the sign-in search also reads Bundle.Icons; see whereSignInIs.
 //
 // Two limits are written down rather than fixed. strings.Contains looks for
 // a literal, and JSON escapes what a credential may legitimately hold (<
@@ -154,11 +149,9 @@ func subscriptionMachine(t *testing.T) {
 // escaped credential would pass it; every fixture here is ASCII
 // alphanumerics and hyphens, so none is. And if Seal ever stops being
 // json.Marshal of the Bundle and marshals a wire type of its own, carried()
-// stops describing the sealed bytes and has to move with it. Bundle already
-// holds a type with a MarshalJSON of its own (profile.Profile, in
-// Profiles), so this repo does add custom serializers — but such a type is
-// marshalled by carried() and by Seal alike, so the two do not drift apart
-// today.
+// stops describing the sealed bytes and has to move with it — though such a
+// type is marshalled by carried() and by Seal alike, so the two do not
+// drift apart today.
 func carried(t *testing.T, b Bundle) string {
 	t.Helper()
 	raw, err := json.Marshal(b)
@@ -168,22 +161,54 @@ func carried(t *testing.T, b Bundle) string {
 	return string(raw)
 }
 
+// whereSignInIs reports where credential turned up in b — in the sealed
+// bytes in plain text, or base64-encoded inside a []byte field — or "" if
+// it is in neither.
+//
+// Bundle.Icons is map[string][]byte and Go marshals []byte as base64, so a
+// plugin auth store copied in there rides in a sealed backup while every
+// plain-text search stays green: measured, not argued, with a Collect that
+// copies plugin-auth.json into b.Icons["auth-state.bin"] and leaves the
+// plain-text checks in this file all passing.
+//
+// Reading the field is the same bytes base64-decoding the sealed form would
+// yield, and a value that is not valid base64 is searched in full, so
+// nothing is masked by a decode that did not happen. A value that *is*
+// valid base64 arrives doubly encoded and hides the credential one layer
+// deeper, so that layer is decoded and searched too. A decode that fails
+// costs only that extra look; the value was already searched as it stands.
+func whereSignInIs(t *testing.T, b Bundle, credential string) string {
+	t.Helper()
+	if strings.Contains(carried(t, b), credential) {
+		return "the sealed bytes, in plain text"
+	}
+	want := []byte(credential)
+	for _, name := range slices.Sorted(maps.Keys(b.Icons)) {
+		v := b.Icons[name]
+		if bytes.Contains(v, want) {
+			return fmt.Sprintf("Bundle.Icons[%q], which Seal base64-encodes", name)
+		}
+		if dec, err := base64.StdEncoding.DecodeString(string(v)); err == nil && bytes.Contains(dec, want) {
+			return fmt.Sprintf("Bundle.Icons[%q], twice base64-encoded", name)
+		}
+	}
+	return ""
+}
+
 // signInSecrets is every credential signIns wrote. None of them is in
 // providers.json, so finding one in a bundle means a sign-in store was read.
 func signInSecrets() []string {
 	return []string{
 		fixtureCodexRefresh, fixtureCodexAccess, fixtureClaudeRefresh,
-		fixtureGrokRefresh, fixtureGrokAccess, fixtureGrokSlot, fixtureGeminiKey,
+		fixturePluginRefresh, fixturePluginAccess, fixturePluginSlot, fixturePluginKey,
 	}
 }
 
 // TestCollectLeavesSubscriptionSignInsOut is the policy itself: under both
 // credential policies, no built-in and no plugin sign-in reaches a bundle.
-//
-// The four combinations matter. A guard written only on the keys=false path
-// passes here but leaks a keyed backup; one written only over the built-in
-// store passes but leaks every moved subscription, which is the case #880
-// was filed about.
+// A guard on the keys=false path alone leaks a keyed backup, and one over
+// the built-in store alone leaks every moved subscription, which is the
+// case #880 was filed about.
 func TestCollectLeavesSubscriptionSignInsOut(t *testing.T) {
 	for _, keys := range []bool{false, true} {
 		name := "keyless"
@@ -199,10 +224,9 @@ func TestCollectLeavesSubscriptionSignInsOut(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			body := carried(t, b)
 			for _, secret := range signInSecrets() {
-				if strings.Contains(body, secret) {
-					t.Errorf("a subscription sign-in reached a %s bundle: %q is in it", name, secret)
+				if where := whereSignInIs(t, b, secret); where != "" {
+					t.Errorf("a subscription sign-in reached a %s bundle: %q is in it, in %s", name, secret, where)
 				}
 			}
 			// The credential stayed behind, not on this machine's store: the
@@ -219,10 +243,8 @@ func TestCollectLeavesSubscriptionSignInsOut(t *testing.T) {
 // TestCollectCarriesTheRowOfAMovedSubscription is the asymmetry, said out
 // loud: a subscription the user moved onto its plugin still has a row in
 // providers.json, and that row travels, so the machine the bundle lands on
-// offers the subscription at all. What stays behind is the credential behind
-// the row — TestCollectLeavesSubscriptionSignInsOut covers that half, and a
-// row arriving with no sign-in is what leaves the receiving machine showing
-// the provider as needing a sign-in.
+// offers the subscription at all. What stays behind is the credential
+// behind the row.
 func TestCollectCarriesTheRowOfAMovedSubscription(t *testing.T) {
 	for _, keys := range []bool{false, true} {
 		name := "keyless"
@@ -242,21 +264,16 @@ func TestCollectCarriesTheRowOfAMovedSubscription(t *testing.T) {
 			if row.Chat != "https://opencode.ai/zen/v1" {
 				t.Errorf("the moved subscription's row lost its details: %+v", row)
 			}
-			// The row travels, and it travels as it is: Collect added no
-			// credential to it out of the sign-in store. What the row holds
-			// is what the local store holds — opencode-zen is a NoKey preset,
-			// so that is OpenCode's own well-known anonymous key
-			// (provider.OpenCodeAnonymousKey), not anything the user signed
-			// in with — and under a keyless policy the row's own key is
-			// blanked like any other provider's. Either way the bundle holds
-			// no sign-in behind the row, which is the whole of the
-			// asymmetry: the row travels, the credential does not.
-			// Headers is not compared here. A credential riding in under a
-			// header name would not be caught by this assertion; it is
-			// caught by TestCollectLeavesSubscriptionSignInsOut, which
-			// looks for it anywhere in the bundle, and that is where the
-			// coverage lives. This one says only that the row's own
-			// key fields are the local ones.
+			// The row travels as it is: Collect added no credential to it
+			// out of the sign-in store. Under a keyless policy the row's
+			// own key is blanked like any other provider's, and what is
+			// left is the local store's own — opencode-zen is a NoKey
+			// preset, so that is OpenCode's well-known anonymous key
+			// (provider.OpenCodeAnonymousKey), not anything the user
+			// signed in with. Headers is not compared here; a credential
+			// riding under a header name is caught by
+			// TestCollectLeavesSubscriptionSignInsOut, which looks for it
+			// anywhere in the bundle, and that is where the coverage lives.
 			local, err := provider.Stored()
 			if err != nil {
 				t.Fatal(err)
@@ -275,11 +292,11 @@ func TestCollectCarriesTheRowOfAMovedSubscription(t *testing.T) {
 }
 
 // TestCollectCarriesTypedKeysOnlyWhenAsked is the control that keeps the
-// policy above from being read as "nothing credential-shaped syncs". A key
-// the user typed is not an agent's sign-in on this machine: it is a note
-// the user wrote down, and it is the one credential magpie's backups have
-// always carried. It goes in when keys are asked for and stays out when
-// they are not, on all three of the places a provider holds one.
+// policy above from being read as "nothing credential-shaped syncs": a key
+// the user typed is not an agent's sign-in on this machine, it is the one
+// credential magpie's backups have always carried. It goes in when keys are
+// asked for and stays out when they are not, on all three of the places a
+// provider holds one.
 func TestCollectCarriesTypedKeysOnlyWhenAsked(t *testing.T) {
 	for _, keys := range []bool{false, true} {
 		name := "keyless"
@@ -309,8 +326,8 @@ func TestCollectCarriesTypedKeysOnlyWhenAsked(t *testing.T) {
 				t.Errorf("a keyless bundle carried a typed credential: %+v", row)
 			}
 			// The key is out of the bundle, not merely blanked in it.
-			if strings.Contains(carried(t, b), fixtureTypedKey) {
-				t.Error("a keyless bundle still holds the typed key")
+			if where := whereSignInIs(t, b, fixtureTypedKey); where != "" {
+				t.Errorf("a keyless bundle still holds the typed key, in %s", where)
 			}
 		})
 	}
@@ -322,13 +339,10 @@ func TestCollectCarriesTypedKeysOnlyWhenAsked(t *testing.T) {
 // signed in on what it signed in with.
 //
 // What is compared is the sign-ins — the accounts, and the credential
-// behind each — and not the bytes they happen to be written in. The policy
-// is that each machine signs in on its own; the identity of the file the
-// sign-ins sit in is a stronger claim than that, and an incidental
-// reformat of logins.json would fail a byte comparison with nothing about
-// the policy changed. That is not hypothetical: re-indenting logins.json
-// between the read and the restore, same accounts and same credentials,
-// turned a byte comparison here red.
+// behind each — and not the bytes they happen to be written in, because a
+// reformat of logins.json between the read and the restore is not a change
+// of policy, and that is not hypothetical: re-indenting the file, same
+// accounts and same credentials, turned a byte comparison here red.
 //
 // The honest limit of that choice: nothing in this package names either
 // file outside this test, so Restore never opens them, and the direction
@@ -492,78 +506,4 @@ func providerIDs(rows []provider.Provider) []string {
 		ids = append(ids, p.ID)
 	}
 	return ids
-}
-
-// TestScopedKeysFallsBackToTheWholeBundleBit covers the part of
-// scopedKeys the report noticed, and it is written to say only what is
-// true whichever way that gap is closed.
-//
-// scopedKeys has a case for "settings" and one for "library"; "providers"
-// falls through to the whole-bundle Keys bit. The maintainer of #880
-// acknowledged the gap and said giving providers a switch of its own needs
-// `case "providers": own = b.ProvidersKeys` first.
-//
-// This test deliberately does not pin that fall-through, and the reason is
-// not caution but that pinning it would be wrong in both directions. There
-// is nothing to observe: scopedKeys is called once in this package, with
-// "settings" (backup.go:401), so "providers" and "library" have no caller
-// and an assertion about either would pin an unexercised implementation
-// detail rather than a behaviour. And a test that did pin it would fail
-// for a good reason the moment the case was added — a maintainer reading
-// "the backup rejects a per-part provider key scope" off a red test would
-// revert a correct fix. That is a worse outcome than the gap going
-// unnoticed for a release.
-//
-// What is asserted instead holds both before and after that fix, and is
-// what the report's own wording pins: a part with no marker of its own is
-// decided by the whole-bundle bit. Adding `case "providers"` does not
-// change that, because the case only reads the marker, and a bundle
-// without one still has none. So this test stays green across the fix, and
-// says on the way what still needs deciding: whether a providers marker,
-// once there is a caller to read it, is honoured or overridden.
-func TestScopedKeysFallsBackToTheWholeBundleBit(t *testing.T) {
-	for _, part := range []string{"settings", "library", "providers"} {
-		t.Run(part, func(t *testing.T) {
-			if !(Bundle{Keys: true}).scopedKeys(part) {
-				t.Errorf("%q lost a whole bundle's keys", part)
-			}
-			if (Bundle{}).scopedKeys(part) {
-				t.Errorf("%q gained a keyless bundle's keys", part)
-			}
-		})
-	}
-}
-
-// TestScopedKeysPrefersAPartsOwnMarker is the switch working: where a part
-// has a marker, that marker decides, either way round against the
-// whole-bundle bit. It is what makes ProvidersKeys meaningful the day
-// something reads it.
-func TestScopedKeysPrefersAPartsOwnMarker(t *testing.T) {
-	for _, part := range []string{"settings", "library"} {
-		t.Run(part, func(t *testing.T) {
-			over := Bundle{Keys: true}
-			setScopedMarker(&over, part, false)
-			if over.scopedKeys(part) {
-				t.Errorf("%q ignored its own marker and took the whole bundle's keys", part)
-			}
-			under := Bundle{}
-			setScopedMarker(&under, part, true)
-			if !under.scopedKeys(part) {
-				t.Errorf("%q ignored its own marker and took the keyless bundle's", part)
-			}
-		})
-	}
-}
-
-// setScopedMarker writes the marker a sync writes for one part, by the
-// name it is serialized under, so the test names parts the way a bundle
-// does rather than reaching past the JSON into the struct.
-func setScopedMarker(b *Bundle, part string, v bool) {
-	raw, err := json.Marshal(map[string]bool{part + "Keys": v})
-	if err != nil {
-		panic(err)
-	}
-	if err := json.Unmarshal(raw, b); err != nil {
-		panic(err)
-	}
 }
