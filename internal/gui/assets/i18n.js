@@ -4,6 +4,12 @@
 // works. {name} slots are filled by t(str, vars).
 const I18N = {
   zh: {
+    "Restore saved settings and remove magpie?": "恢复已保存的设置并移除 magpie？",
+    "Restore saved settings and remove magpie without contacting Aside? Close Aside first if it is running.": "要在不连接 Aside 的情况下恢复已保存的设置并移除 magpie 吗？如果 Aside 正在运行，请先关闭 Aside。",
+    "Restore saved settings and remove magpie": "恢复已保存的设置并移除 magpie",
+    "Saved settings restored; magpie was removed from {agent}": "已恢复保存的设置，并从 {agent} 移除了 magpie",
+    "Disconnect preview changed; preview it again": "断开预览已改变，请重新预览",
+
     "Aside is unavailable. Save this model for its next start?": "无法连接 Aside。要保存此模型供下次启动使用吗？",
     "Save for next start": "保存供下次启动使用",
     "Saved for Aside's next start; the running model has not been changed": "已保存供 Aside 下次启动使用，当前运行模型未改变",
@@ -3142,6 +3148,12 @@ const I18N = {
     "credits": "积分",
   },
   ja: {
+    "Restore saved settings and remove magpie?": "保存済みの設定を復元して magpie を削除しますか？",
+    "Restore saved settings and remove magpie without contacting Aside? Close Aside first if it is running.": "Aside に接続せずに保存済みの設定を復元して magpie を削除しますか？Aside が実行中の場合は、先に終了してください。",
+    "Restore saved settings and remove magpie": "保存済みの設定を復元して magpie を削除",
+    "Saved settings restored; magpie was removed from {agent}": "保存済みの設定を復元し、{agent} から magpie を削除しました",
+    "Disconnect preview changed; preview it again": "切断プレビューが変更されました。再度プレビューしてください",
+
     "Aside is unavailable. Save this model for its next start?": "Aside を利用できません。このモデルを次回起動時用に保存しますか？",
     "Save for next start": "次回起動時用に保存",
     "Saved for Aside's next start; the running model has not been changed": "Aside の次回起動時用に保存しました。実行中のモデルは変更していません",
@@ -6257,6 +6269,12 @@ const I18N = {
     "{agent} is signed in to this account and asks its vendor itself, not through magpie, so with no other account on to move it to, {agent} goes on using it past the cap. Add another account, or pick {agent}'s models via magpie, for the cap to hold it": "{agent} はこのアカウントでサインインしており、magpie を経由せず自分でベンダーに要求します。切り替え先となる有効なアカウントが他にないため、{agent} は上限を超えても使い続けます。上限を効かせるには、別のアカウントを追加するか、{agent} のモデルを magpie 経由で選んでください",
   },
   de: {
+    "Restore saved settings and remove magpie?": "Gespeicherte Einstellungen wiederherstellen und magpie entfernen?",
+    "Restore saved settings and remove magpie without contacting Aside? Close Aside first if it is running.": "Gespeicherte Einstellungen wiederherstellen und magpie entfernen, ohne Aside zu kontaktieren? Schließe Aside zuerst, falls es läuft.",
+    "Restore saved settings and remove magpie": "Gespeicherte Einstellungen wiederherstellen und magpie entfernen",
+    "Saved settings restored; magpie was removed from {agent}": "Gespeicherte Einstellungen wiederhergestellt; magpie wurde aus {agent} entfernt",
+    "Disconnect preview changed; preview it again": "Die Trennungsvorschau hat sich geändert; bitte erneut anzeigen",
+
     "Aside is unavailable. Save this model for its next start?": "Aside ist nicht verfügbar. Dieses Modell für den nächsten Start speichern?",
     "Save for next start": "Für den nächsten Start speichern",
     "Saved for Aside's next start; the running model has not been changed": "Für den nächsten Aside-Start gespeichert. Das laufende Modell wurde nicht geändert",

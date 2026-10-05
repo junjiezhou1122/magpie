@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/provider"
@@ -78,7 +79,12 @@ func (c *asideConnection) settings() map[string]json.RawMessage {
 }
 
 func (c *asideConnection) liveSettings() map[string]json.RawMessage {
-	c.snapshot, c.readErr = asideRead()
+	snapshot, err := asideRead()
+	return c.reconcileSettings(snapshot, err)
+}
+
+func (c *asideConnection) reconcileSettings(snapshot map[string]json.RawMessage, readErr error) map[string]json.RawMessage {
+	c.snapshot, c.readErr = snapshot, readErr
 	c.read = c.readErr == nil
 	if c.snapshot == nil {
 		c.snapshot = map[string]json.RawMessage{}
@@ -409,27 +415,52 @@ func asideImageOffered(value string) bool {
 	return false
 }
 
+func (c *asideConnection) validateSelection(key, value string) (string, error) {
+	a := asideIn(c.at)
+	if a.Field(key) == nil {
+		return "", fmt.Errorf("unknown Aside field %q", key)
+	}
+	if key == "effort" || value == "" {
+		return value, nil
+	}
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(value, "magpie/") {
+		if _, err := a.Spell(key, value); err != nil {
+			return "", err
+		}
+	}
+	p, m, ok := strings.Cut(value, "/")
+	if !ok || p == "" || m == "" {
+		return "", fmt.Errorf("expected provider/model")
+	}
+	if key == "image" && p == "magpie" && !asideImageOffered(value) {
+		return "", fmt.Errorf("%s is not an image generation model", value)
+	}
+	return value, nil
+}
+
 func (c *asideConnection) apply(key, value string) error {
 	asideMu.Lock()
 	defer asideMu.Unlock()
+	value, err := c.validateSelection(key, value)
+	if err != nil {
+		return err
+	}
+	if _, err := c.load(); err != nil {
+		return err
+	}
 	c.read = false
-	if _, err := c.liveSettings(), c.readErr; err != nil {
-		return fmt.Errorf("Aside must answer before a model setting can change: %w", err)
-	}
-	s := c.snapshot
-	if key == "image" && strings.HasPrefix(value, "magpie/") && value != c.value(key) && !asideImageOffered(value) {
-		return fmt.Errorf("%s is not an image generation model", value)
-	}
-	if key != "model" && key != "effort" && key != "image" {
-		found := false
-		for _, role := range asideRoles {
-			if role == key {
-				found = true
-			}
+	snapshot, err := asideRead()
+	if err != nil {
+		action := OfflineAction("")
+		if key != "effort" && value != "" {
+			action = OfflineStage
 		}
-		if !found {
-			return fmt.Errorf("unknown Aside field %q", key)
-		}
+		return &RuntimeUnavailableError{Agent: "aside", Operation: "apply", Offline: action, Cause: err}
+	}
+	s := c.reconcileSettings(snapshot, nil)
+	if c.readErr != nil {
+		return c.readErr
 	}
 	r, err := c.load()
 	if err != nil {
@@ -550,6 +581,11 @@ func (c *asideConnection) setSetting(key string, raw json.RawMessage) error {
 func (c *asideConnection) plan() (*DisconnectPlan, error) {
 	asideMu.Lock()
 	defer asideMu.Unlock()
+	return c.planLocked()
+}
+
+func (c *asideConnection) planLocked() (*DisconnectPlan, error) {
+	filememo.Forget()
 	status, detail := c.provider()
 	if status == "foreign" {
 		return nil, fmt.Errorf("%s", detail)
@@ -601,6 +637,20 @@ func (c *asideConnection) plan() (*DisconnectPlan, error) {
 	if err != nil {
 		return nil, err
 	}
+	record, err := edit.Read(c.record)
+	if err != nil {
+		return nil, err
+	}
+	empty, _ := json.MarshalIndent(asideRecord{Fields: map[string]asideOwned{}}, "", "  ")
+	plan.Files = append(plan.Files, PlannedFile{Path: c.record, Before: record, After: append(empty, '\n')})
+	// Legacy restore points come from the stash only while no record exists.
+	if len(record) == 0 {
+		legacy, err := edit.Read(stashPath())
+		if err != nil {
+			return nil, err
+		}
+		plan.Files = append(plan.Files, PlannedFile{Path: stashPath(), Before: legacy, After: legacy})
+	}
 	plan.Files = append(plan.Files, PlannedFile{Path: c.models, Before: models, After: without})
 	return plan, nil
 }
@@ -612,9 +662,13 @@ func (c *asideConnection) execute(plan *DisconnectPlan) error {
 		return err
 	}
 	if len(plan.Settings) > 0 {
-		s := c.liveSettings()
+		snapshot, err := asideRead()
+		if err != nil {
+			return &RuntimeUnavailableError{Agent: "aside", Operation: "disconnect", Offline: OfflineDisconnect, Cause: err}
+		}
+		s := c.reconcileSettings(snapshot, nil)
 		if c.readErr != nil {
-			return fmt.Errorf("Aside must be running to restore its selected models: %w", c.readErr)
+			return c.readErr
 		}
 		for _, change := range plan.Settings {
 			if !asideSameSetting(asideRaw(s, change.Key), change.Before) {
@@ -649,4 +703,36 @@ func (c *asideConnection) execute(plan *DisconnectPlan) error {
 		return err
 	}
 	return nil
+}
+
+func (c *asideConnection) executeOffline(plan *DisconnectPlan) error {
+	asideMu.Lock()
+	defer asideMu.Unlock()
+	if plan == nil {
+		return fmt.Errorf("missing Aside disconnect plan")
+	}
+	// Rebuilding under the lock also verifies ownership and the plan structure.
+	current, err := c.planLocked()
+	if err != nil {
+		return err
+	}
+	if plan.Revision("aside") != current.Revision("aside") {
+		return fmt.Errorf("Aside disconnect plan changed; preview it again")
+	}
+	if err := plan.CheckFiles(); err != nil {
+		return err
+	}
+	return edit.Atomically(func() error {
+		if err := edit.WriteAtomic(c.path, plan.Files[0].After); err != nil {
+			return err
+		}
+		if err := c.save(asideRecord{Fields: map[string]asideOwned{}}); err != nil {
+			return err
+		}
+		if err := edit.WriteAtomic(c.models, plan.Files[len(plan.Files)-1].After); err != nil {
+			return err
+		}
+		c.read = false
+		return nil
+	}, c.path, c.models, c.record)
 }

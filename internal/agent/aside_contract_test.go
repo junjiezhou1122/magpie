@@ -66,6 +66,9 @@ func TestAsideRuntimeRefusalDoesNotCommitOwnership(t *testing.T) {
 
 func TestAsideModelChangesKeepOriginalRestorePoint(t *testing.T) {
 	_, _ = asideHome(t)
+	if err := provider.Save(provider.Provider{ID: "relay", Name: "Relay", Key: "k", Chat: "http://127.0.0.1:1/v1", Models: []string{"one", "two"}}); err != nil {
+		t.Fatal(err)
+	}
 	a := mustFindAside(t)
 	for _, v := range []string{"magpie/relay/one", "magpie/relay/two"} {
 		if err := a.Apply("model", v); err != nil {
@@ -171,7 +174,7 @@ func TestAsideBrokenProviderFileIsNeverOverwritten(t *testing.T) {
 func TestAsideSettingsIDsAreQuoted(t *testing.T) {
 	asideHome(t)
 	a := mustFindAside(t)
-	value := `magpie/x\";throw new Error('injected');`
+	value := `native/x\";throw new Error('injected');`
 	if err := a.Apply("model", value); err != nil {
 		t.Fatal(err)
 	}

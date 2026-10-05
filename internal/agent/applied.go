@@ -366,7 +366,11 @@ func (a *Agent) Wired() bool {
 // list, and Disconnect puts back what it had before.
 func (a *Agent) Pick(key, v string) error {
 	if a.Native != nil {
-		return a.Apply(key, v)
+		value, err := a.Spell(key, v)
+		if err != nil {
+			return err
+		}
+		return a.Apply(key, value)
 	}
 	if f := a.Field(key); f != nil && !a.Wired() {
 		vals := a.Values()
@@ -623,6 +627,19 @@ func (a *Agent) Disconnect() error {
 	stash(map[string]string{a.ID + ".reconnect": string(b)})
 	a.Keep()
 	return nil
+}
+
+// DisconnectOffline restores a native agent's saved files only after an
+// explicit offline choice. Legacy callers of Disconnect keep live semantics.
+func (a *Agent) DisconnectOffline() error {
+	if a.Native == nil || a.Native.ExecuteOffline == nil {
+		return fmt.Errorf("%s does not support offline disconnect", a.Name)
+	}
+	plan, err := a.Native.Disconnect()
+	if err != nil {
+		return err
+	}
+	return a.Native.ExecuteOffline(plan)
 }
 
 // reconnection is what Disconnect took an agent off: the values of its

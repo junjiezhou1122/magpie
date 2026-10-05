@@ -15,24 +15,11 @@ func (c *asideConnection) stage(key, value string) error {
 	if key == "effort" || value == "" {
 		return fmt.Errorf("select a model to save for Aside's next start")
 	}
-	if key != "model" && key != "image" {
-		valid := false
-		for _, role := range asideRoles {
-			if role == key {
-				valid = true
-			}
-		}
-		if !valid {
-			return fmt.Errorf("unknown Aside field %q", key)
-		}
+	value, err := c.validateSelection(key, value)
+	if err != nil {
+		return err
 	}
-	p, m, ok := strings.Cut(value, "/")
-	if !ok || p == "" || m == "" {
-		return fmt.Errorf("expected provider/model")
-	}
-	if key == "image" && p == "magpie" && !asideImageOffered(value) {
-		return fmt.Errorf("%s is not an image generation model", value)
-	}
+	p, m, _ := strings.Cut(value, "/")
 	b, err := edit.Read(c.path)
 	if err != nil {
 		return err

@@ -94,6 +94,10 @@ async function api(path, body) {
   }
   if (!res.ok) {
     const err = new Error(data?.error || `${res.status} ${res.statusText}`);
+    if (data?.code === "runtime_unavailable") {
+      err.code = data.code;
+      if (data.offline === "stage" || data.offline === "disconnect") err.offline = data.offline;
+    }
     if (data?.why) err.why = data.why; // a failed move's reason, said in the reader's language
     throw err;
   }
@@ -1333,7 +1337,7 @@ function connectPanel(a, { fields, fieldBtn }) {
     diff.replaceChildren(changesList(changes));
   };
   if (previews[a.id]) fill(previews[a.id]);
-  loadPreview(a).then(fill, () => {});
+  loadPreview(a).then((preview) => fill(preview.changes), () => {});
   return box;
 }
 
@@ -1341,7 +1345,7 @@ async function loadPreview(a) {
   const r = await api("agents/preview/" + a.id);
   if (r?.error) throw new Error(r.error);
   previews[a.id] = r?.changes || [];
-  return previews[a.id];
+  return { changes: previews[a.id], revision: typeof r?.revision === "string" ? r.revision : "" };
 }
 
 // changesList: what disconnecting does to each file, line by line
@@ -1399,30 +1403,44 @@ function askDisconnect(a) {
   };
   if (previews[a.id]) show(previews[a.id]);
   else body.append(el("div", "ag-diff-loading", t("Reading what changes…")));
-  let previewBlocked = false;
-  loadPreview(a).then(show, (err) => { if (!a.native) { show(null); return; } previewBlocked = true; go.disabled = true; body.replaceChildren(el("p", "lib-confirm", t(err.message))); });
+  let previewBlocked = !!a.native, revision = "", offline = false;
+  loadPreview(a).then((preview) => {
+    show(preview.changes);
+    revision = preview.revision;
+    previewBlocked = !!a.native && !revision;
+    go.disabled = previewBlocked;
+  }, (err) => { if (!a.native) { show(null); return; } previewBlocked = true; go.disabled = true; body.replaceChildren(el("p", "lib-confirm", t(err.message))); });
   ed.append(body);
   if (a.id === "codex") ed.append(el("p", "ag-note", t("magpie's provider table stays, so sessions opened on magpie's models still open")));
   const bar = el("div", "bar");
   const go = el("button", "text primary danger-fill", t("Disconnect and restore"));
+  go.disabled = previewBlocked;
   go.onclick = async (e) => {
     e.stopPropagation();
     if (previewBlocked) return;
     go.disabled = true;
     go.classList.add("busy");
     try {
-      state = await api("agents/disconnect/" + a.id, {});
+      state = await api("agents/" + (offline ? "disconnect-offline/" : "disconnect/") + a.id, offline ? { revision } : {});
       closeConfirmAsk();
       delete previews[a.id];
       if (agentExpanded === a.id) agentExpanded = null;
       renderAgents();
-      const msg = t("{agent} no longer goes through magpie; its own settings are back", { agent: a.name });
+      const msg = t(offline ? "Saved settings restored; magpie was removed from {agent}" : "{agent} no longer goes through magpie; its own settings are back", { agent: a.name });
       if (state.notice) status(`${msg}. ${t(state.notice)}`, "warn", 9000);
       else status(msg, "ok");
     } catch (err) {
       go.disabled = false;
       go.classList.remove("busy");
-      status(err.message, "err");
+      if (!offline && err.code === "runtime_unavailable" && err.offline === "disconnect" && revision) {
+        offline = true;
+        head.querySelector("b").textContent = t("Restore saved settings and remove magpie?");
+        ed.querySelector(".lib-confirm").textContent = t("Restore saved settings and remove magpie without contacting Aside? Close Aside first if it is running.");
+        go.textContent = t("Restore saved settings and remove magpie");
+        cancel.focus({ preventScroll: true });
+        return;
+      }
+      status(t(err.message), "err");
     }
   };
   const cancel = el("button", "text", t("Cancel"));
@@ -4007,15 +4025,23 @@ async function setPick(agent, field, value, opt) {
   // seconds (every agent's lists are read again for it). The answer then
   // draws what the config really says; a refused pick puts the old one back.
   const was = field.value;
-  if (agent.native?.runtime === "unavailable" && field.key !== "effort" && value) {
-    const ed = el("div", "editor disconnect-ask"); ed.append(el("p", "lib-confirm", t("Aside is unavailable. Save this model for its next start?")));
-    const bar = el("div", "bar"), cancel = el("button", "text", t("Cancel")), save = el("button", "text primary", t("Save for next start"));
-    cancel.onclick = () => closeConfirmAsk(); save.onclick = async () => { save.disabled = true; try { state = await api("agents/stage/" + agent.id, { field: field.key, value }); closeConfirmAsk(); renderAgents(); } catch (err) { save.disabled = false; status(t(err.message), "err"); } };
-    bar.append(cancel, save); ed.append(bar); confirmAsk = ed; openModal(ed); return;
-  }
   if (agent.native) {
     try { state = await api("set", { agent: agent.id, field: field.key, value }); renderAgents(); }
-    catch (err) { status(t(err.message), "err"); }
+    catch (err) {
+      if (err.code === "runtime_unavailable" && err.offline === "stage") {
+        const ed = el("div", "editor disconnect-ask");
+        ed.append(el("p", "lib-confirm", t("Aside is unavailable. Save this model for its next start?")));
+        const bar = el("div", "bar"), cancel = el("button", "text", t("Cancel")), save = el("button", "text primary", t("Save for next start"));
+        cancel.onclick = () => closeConfirmAsk();
+        save.onclick = async () => {
+          save.disabled = true;
+          try { state = await api("agents/stage/" + agent.id, { field: field.key, value }); closeConfirmAsk(); renderAgents(); }
+          catch (err) { save.disabled = false; status(t(err.message), "err"); }
+        };
+        bar.append(cancel, save); ed.append(bar); confirmAsk = ed; openModal(ed);
+        cancel.focus({ preventScroll: true });
+      } else status(t(err.message), "err");
+    }
     return;
   }
   const leaving = leavesMagpie(agent, field, value, opt);

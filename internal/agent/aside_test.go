@@ -215,7 +215,8 @@ func TestAsidePreviewIsAPurePlan(t *testing.T) {
 	if err := a.Apply("model", "magpie/relay/glm-4.6"); err != nil {
 		t.Fatal(err)
 	}
-	before := readFile(settings) + readFile(models)
+	record := newAsideConnection(here("")).record
+	before := readFile(settings) + readFile(models) + readFile(record)
 	asideSet = func(string, string) error { t.Fatal("preview wrote runtime"); return nil }
 	asideRead = func() (map[string]json.RawMessage, error) { t.Fatal("preview invoked runtime"); return nil, nil }
 	for i := 0; i < 3; i++ {
@@ -223,11 +224,11 @@ func TestAsidePreviewIsAPurePlan(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(changes) != 2 {
+		if len(changes) != 3 {
 			t.Fatalf("plan changes %v", changes)
 		}
 	}
-	if readFile(settings)+readFile(models) != before {
+	if readFile(settings)+readFile(models)+readFile(record) != before {
 		t.Fatal("preview changed live files")
 	}
 }
