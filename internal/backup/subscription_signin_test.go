@@ -18,9 +18,12 @@ package backup
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -128,11 +131,34 @@ func subscriptionMachine(t *testing.T) {
 	signIns(t)
 }
 
-// carried is every string in the bundle as it would be written to a file.
-// Seal marshals the bundle with exactly this call, so a credential absent
-// from this string cannot be inside a sealed backup either — which is what
-// lets these tests read the bundle's own bytes instead of guessing which of
-// its fields a sign-in might hide in.
+// carried is the bundle as the bytes of a sealed backup would hold them.
+// Seal marshals the whole Bundle in one call (backup.go:252), so these are
+// the bytes that get sealed: a credential that does not appear in them in
+// plain text does not reach a sealed backup in plain text either, and
+// reading the bundle's own bytes says that without guessing which of its
+// fields a sign-in might hide in.
+//
+// That is a statement about plain text, and plain text is what the policy
+// is about: what must not reach another machine is a credential that
+// machine can read. It is not a proof that no sign-in can be in there. A
+// []byte field is base64 in these bytes — Bundle.Icons is
+// map[string][]byte — so an account that rode in under one of them would
+// sit in a sealed backup with this check still green. Measured, not
+// argued: a Collect that copies plugin-auth.json into
+// b.Icons["auth-state.bin"] puts the whole plugin store in the bundle and
+// leaves every test here passing.
+//
+// Two limits are written down rather than fixed. strings.Contains looks for
+// a literal, and JSON escapes what a credential may legitimately hold (<
+// and & become \u003c and \u0026, non-ASCII becomes \uXXXX), so an
+// escaped credential would pass it; every fixture here is ASCII
+// alphanumerics and hyphens, so none is. And if Seal ever stops being
+// json.Marshal of the Bundle and marshals a wire type of its own, carried()
+// stops describing the sealed bytes and has to move with it. Bundle already
+// holds a type with a MarshalJSON of its own (profile.Profile, in
+// Profiles), so this repo does add custom serializers — but such a type is
+// marshalled by carried() and by Seal alike, so the two do not drift apart
+// today.
 func carried(t *testing.T, b Bundle) string {
 	t.Helper()
 	raw, err := json.Marshal(b)
@@ -225,6 +251,12 @@ func TestCollectCarriesTheRowOfAMovedSubscription(t *testing.T) {
 			// blanked like any other provider's. Either way the bundle holds
 			// no sign-in behind the row, which is the whole of the
 			// asymmetry: the row travels, the credential does not.
+			// Headers is not compared here. A credential riding in under a
+			// header name would not be caught by this assertion; it is
+			// caught by TestCollectLeavesSubscriptionSignInsOut, which
+			// looks for it anywhere in the bundle, and that is where the
+			// coverage lives. This one says only that the row's own
+			// key fields are the local ones.
 			local, err := provider.Stored()
 			if err != nil {
 				t.Fatal(err)
@@ -287,22 +319,28 @@ func TestCollectCarriesTypedKeysOnlyWhenAsked(t *testing.T) {
 // TestRestoreLeavesLocalSignInsAlone is the other end of the policy: a
 // bundle that cannot carry a sign-in also cannot take one away, so
 // restoring one onto a machine that is already signed in leaves the machine
-// signed in. The sign-ins are checked byte for byte, since a restore that
-// rewrote either file with the same accounts would still be a machine whose
-// sign-ins the backup touched.
+// signed in on what it signed in with.
+//
+// What is compared is the sign-ins — the accounts, and the credential
+// behind each — and not the bytes they happen to be written in. The policy
+// is that each machine signs in on its own; the identity of the file the
+// sign-ins sit in is a stronger claim than that, and an incidental
+// reformat of logins.json would fail a byte comparison with nothing about
+// the policy changed. That is not hypothetical: re-indenting logins.json
+// between the read and the restore, same accounts and same credentials,
+// turned a byte comparison here red.
+//
+// The honest limit of that choice: nothing in this package names either
+// file outside this test, so Restore never opens them, and the direction
+// of the policy is all this can characterise. It is deliberately not
+// written as a claim that those files are untouchable — a future restore
+// that did own them would need a real assertion of its own, not this one.
 func TestRestoreLeavesLocalSignInsAlone(t *testing.T) {
 	home(t)
 	appdir.UseExecutable("")
 	subscriptionMachine(t)
-	logins := filepath.Join(settings.Dir(), "logins.json")
-	before := map[string][]byte{}
-	for _, path := range []string{logins, plugin.AuthPath()} {
-		b, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		before[path] = b
-	}
+	beforeBuiltIn := builtInSignIns(t)
+	beforePlugin := pluginSignIns(t)
 
 	if _, err := Restore(Bundle{Version: BundleVersion, Keys: true}, All); err != nil {
 		t.Fatal(err)
@@ -311,20 +349,116 @@ func TestRestoreLeavesLocalSignInsAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for path, want := range before {
-		got, err := os.ReadFile(path)
-		if err != nil {
-			t.Errorf("restoring a backup disturbed this machine's sign-ins at %s: %v", filepath.Base(path), err)
-			continue
-		}
-		if !bytes.Equal(got, want) {
-			t.Errorf("restoring a backup rewrote %s: %q is now %q", filepath.Base(path), want, got)
+	if after := builtInSignIns(t); !sameSignIns(beforeBuiltIn, after) {
+		t.Errorf("restoring a backup changed this machine's built-in sign-ins: %s is now %s",
+			signInsString(beforeBuiltIn), signInsString(after))
+	}
+	if after := pluginSignIns(t); after != beforePlugin {
+		t.Errorf("restoring a backup changed this machine's plugin sign-ins: %s is now %s", beforePlugin, after)
+	}
+	// And the sign-ins are there to be read, not merely equal to whatever
+	// was read before. Without this the two comparisons above would also
+	// pass on a pair of empty reads.
+	have := signInsString(builtInSignIns(t)) + pluginSignIns(t)
+	for _, secret := range signInSecrets() {
+		if !strings.Contains(have, secret) {
+			t.Errorf("the local sign-in %q is gone after a restore", secret)
 		}
 	}
-	// And the accounts are still there to be read, not just their bytes.
-	if logins, err := os.ReadFile(logins); err != nil || !bytes.Contains(logins, []byte(fixtureCodexRefresh)) {
-		t.Errorf("the local built-in sign-in is gone after a restore: %v", err)
+}
+
+// localSignIn is one row of logins.json as far as this policy is concerned:
+// who is signed in, and the credential that signs them in. The rest of a
+// row — the plan, when it was last seen, where it sits in the list — is not
+// part of "this machine signs in on its own", so it is not read here.
+type localSignIn struct {
+	Agent string
+	User  string
+	Home  string
+	Auth  string
+}
+
+// builtInSignIns reads logins.json as the sign-ins it holds, with each
+// row's credential canonicalised and the rows put in a fixed order, so that
+// how the file was written is not part of what is compared.
+func builtInSignIns(t *testing.T) []localSignIn {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(settings.Dir(), "logins.json"))
+	if err != nil {
+		t.Fatal(err)
 	}
+	var rows []struct {
+		Agent string          `json:"agent"`
+		User  string          `json:"user"`
+		Home  string          `json:"home"`
+		Auth  json.RawMessage `json:"auth"`
+	}
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		t.Fatalf("this machine's logins.json does not read: %v", err)
+	}
+	out := make([]localSignIn, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, localSignIn{r.Agent, r.User, r.Home, canonical(t, r.Auth)})
+	}
+	slices.SortFunc(out, func(a, b localSignIn) int {
+		return cmp.Or(cmp.Compare(a.Agent, b.Agent), cmp.Compare(a.User, b.User), cmp.Compare(a.Home, b.Home))
+	})
+	return out
+}
+
+// pluginSignIns reads plugin-auth.json the same way: the accounts it holds
+// and what each of them keeps, canonicalised.
+func pluginSignIns(t *testing.T) string {
+	t.Helper()
+	raw, err := os.ReadFile(plugin.AuthPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return canonical(t, raw)
+}
+
+// canonical re-marshals JSON so two documents compare by what they say.
+// Go writes a map's keys in order, so the result follows the content alone
+// and not the indentation, the key order on the page, or the trailing
+// newline. A field that is not there at all reads as the null it means, so
+// an absent credential and an explicit null compare equal.
+func canonical(t *testing.T, raw []byte) string {
+	t.Helper()
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return "null"
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		t.Fatalf("%s does not read as JSON: %v", raw, err)
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// sameSignIns reports whether the two reads name the same accounts with the
+// same credentials, each read already in a fixed order.
+func sameSignIns(a, b []localSignIn) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// signInsString is a machine's sign-ins as one line a failure can print.
+func signInsString(ls []localSignIn) string {
+	parts := make([]string, 0, len(ls))
+	for _, l := range ls {
+		parts = append(parts, fmt.Sprintf("%s %s home=%s auth=%s", l.Agent, l.User, l.Home, l.Auth))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func providerRow(t *testing.T, b Bundle, id string) provider.Provider {
