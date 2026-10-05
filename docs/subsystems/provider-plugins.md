@@ -43,7 +43,7 @@ The editor's "Move to plugin" action calls `provider.Adopt`. With accounts, adop
 
 Installing the plugin independently can also hand over ownership through `provider.HandOver`. The package must be enabled, meet the mover's minimum version, and serve the expected provider. After add, update, or upgrade, the GUI calls `HandOver(ctx, false)`, which can adopt a built-in with no accounts. Existing built-in accounts wait for `HandOver(ctx, true)` in gateway maintenance.
 
-`KeepRetiringMoved` first runs after 20 seconds, then hourly. It maintains moved plugin versions and performs automatic handover. Handover preserves a plugin already signed in under its separate `-plugin` id and skips existing migration records except a `failed` record old enough to retry.
+`KeepRetiringMoved` first runs after 20 seconds, then hourly. It maintains moved plugin versions and performs automatic handover. Handover preserves a plugin already signed in under its separate `-plugin` id and skips existing migration records except a `failed` record old enough to retry. The same loop calls `MoveRetiring` for the ids in `provider.Retiring`, the built-ins magpie moves onto their plugins by itself instead of waiting for the user. `Retiring` is currently empty, so that path moves nothing today.
 
 `MoveBack` restores built-in ownership and records `back`. Compatible accounts added through the plugin can return too; incompatible accounts can remain with the plugin under its separate id. Removing or disabling a plugin first moves affected built-ins back and stops if that fails. A package installed by the user remains after moving back; a migration-installed package is removed only when no remaining signed-in or moved provider needs it.
 
@@ -71,7 +71,9 @@ Run the relevant package tests with an isolated home directory:
 
 ```sh
 verification_home=$(mktemp -d)
-HOME="$verification_home" go test -tags nogui ./internal/provider ./internal/gateway ./internal/plugin
+HOME="$verification_home" GOMODCACHE="$(go env GOMODCACHE)" GOCACHE="$(go env GOCACHE)" \
+  go test -tags nogui ./internal/provider ./internal/gateway ./internal/plugin
+rm -rf "$verification_home"
 ```
 
 Some migration and gateway plugin tests require Bun on PATH and use local plugin fixtures; they skip when Bun is unavailable. Report any skipped tests and verify the community package separately when its implementation changes.
