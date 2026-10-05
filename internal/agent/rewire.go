@@ -75,6 +75,9 @@ func Rewire(as []*Agent) (moved []string, err error) {
 // reset sets an agent's wiring again: one joined beside its own models
 // joined again, any other's fields set again.
 func reset(a *Agent) error {
+	if a.Native != nil {
+		return a.Native.Connect()
+	}
 	if a.Join != nil && a.Joined != nil && a.Joined() {
 		ok, err := a.Join()
 		if err != nil || ok {

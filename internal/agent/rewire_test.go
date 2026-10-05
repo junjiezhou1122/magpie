@@ -60,6 +60,13 @@ func TestPortMovesEveryAgent(t *testing.T) {
 		if a.Check == nil || a.Launch != nil || a.WSL != "" {
 			continue
 		}
+		if a.Native != nil {
+			if err := a.Connect(); err != nil {
+				t.Fatal(err)
+			}
+			wired = append(wired, a)
+			continue
+		}
 		var key, want string
 		for _, g := range a.Fields {
 			for _, o := range g.Options(a.Values()) {

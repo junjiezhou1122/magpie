@@ -295,6 +295,9 @@ function renderAgents() {
       c.append(svg(CHEV, 11, 1.7));
       b.append(c);
       b.dataset.key = f.key;
+      const fieldState = a.native?.fields?.[f.key];
+      if (fieldState?.detail) b.title += "\n" + t(fieldState.detail);
+      if (fieldState?.status === "unavailable") b.classList.add("drifted");
       b.onclick = (ev) => openPicker(a, f, b, ev);
       return b;
     };
@@ -803,6 +806,7 @@ const CONNECTED_HOW = {
 };
 function connectedSaid(a, c) {
   const plain = t("{agent} is connected to magpie", { agent: a.name });
+  if (a.native && c?.how === "joined") return t("{agent} is connected to magpie", { agent: a.name });
   if (c?.how === "joined") return t("{agent} is connected to magpie · it stays on its own last pick; magpie's models join its {cmd}", { agent: a.name, cmd: PICKS_IN[a.id] || "/model" });
   const now = state.agents.find((x) => x.id === a.id);
   const f = now && startField(now);
@@ -958,6 +962,11 @@ function connectLine(a, kind) {
     return line;
   }
   if (kind === "empty") { say(t("Add a key or a subscription first; then there are models to connect")); return line; }
+  if (!a.wired && a.native && a.native.provider !== "disconnected") {
+    say(t(a.native.detail), "bad");
+    if (a.native.provider === "invalid") line.append(driftFix(a, "Reconnect"));
+    return line;
+  }
   if (!a.wired) {
     const src = a.source || "";
     if (a.id === "agy") say(t("Not connected · once connected, start it with magpie's command"));
@@ -966,6 +975,10 @@ function connectLine(a, kind) {
     else if (src === "key") say(t("Not connected · now on an API key of its own"));
     else if (src.startsWith("providers:")) say(t("Not connected · now has {n} providers of its own", { n: src.slice(10) }));
     else say(t("Not connected · {agent} uses its own settings", { agent: a.name }));
+    return line;
+  }
+  if (a.native) {
+    say(connectSaid(a), "on");
     return line;
   }
   if (a.drift) {
@@ -1052,7 +1065,7 @@ function startField(a) {
 // offers magpie's models alone.
 function startButton(a, f, fieldBtn) {
   const b = fieldBtn(f, "ag-start");
-  if (!a.wired && f.key !== "model" && !f.options.some((o) => o.direct)) {
+  if (!a.wired && !a.native && f.key !== "model" && !f.options.some((o) => o.direct)) {
     b.replaceChildren(el("span", "v empty", t("Pick a model")));
     const c = el("span", "chev");
     c.append(svg(CHEV, 11, 1.7));
@@ -1277,6 +1290,9 @@ function connectPanel(a, { fields, fieldBtn }) {
     }
     kv(t("New sessions"), line(fields));
   }
+  if (a.native) for (const [key, detail] of Object.entries(a.native.fields || {})) {
+    if (detail.detail) { const f = a.fields.find((x) => x.key === key); kv(t(f?.label || key), line(t(detail.detail))); }
+  }
   if (CONNECT_COST[a.id]) kv(t("Once connected"), line(t(CONNECT_COST[a.id])));
   if (a.launch) {
     const cp = el("button", "ag-quiet", t("Copy"));
@@ -1383,13 +1399,15 @@ function askDisconnect(a) {
   };
   if (previews[a.id]) show(previews[a.id]);
   else body.append(el("div", "ag-diff-loading", t("Reading what changes…")));
-  loadPreview(a).then(show, () => show(null));
+  let previewBlocked = false;
+  loadPreview(a).then(show, (err) => { if (!a.native) { show(null); return; } previewBlocked = true; go.disabled = true; body.replaceChildren(el("p", "lib-confirm", t(err.message))); });
   ed.append(body);
   if (a.id === "codex") ed.append(el("p", "ag-note", t("magpie's provider table stays, so sessions opened on magpie's models still open")));
   const bar = el("div", "bar");
   const go = el("button", "text primary danger-fill", t("Disconnect and restore"));
   go.onclick = async (e) => {
     e.stopPropagation();
+    if (previewBlocked) return;
     go.disabled = true;
     go.classList.add("busy");
     try {
@@ -3927,6 +3945,7 @@ async function commit(value) {
     return;
   }
   if (value === field.value) return;
+  if (agent.native) return setPick(agent, field, value, opt);
   // a pick that takes a connected agent off magpie (its Default, or a
   // model of its own asked of its vendor directly) is asked first, as the
   // switch's off is: it moved Claude Code under Not set up at a click
@@ -3941,7 +3960,7 @@ async function commit(value) {
 // directly (Claude Code's own, which unroutes it). From one of its own
 // models already, the pick doesn't move it off magpie.
 function leavesMagpie(a, field, value, opt) {
-  if (!a?.wired || !connectable(a) || field !== (startField(a) || connectField(a))) return false;
+  if (a?.native || !a?.wired || !connectable(a) || field !== (startField(a) || connectField(a))) return false;
   if (optionFor(field, field.value)?.direct) return false;
   return value === "" || !!opt?.direct;
 }
@@ -3988,6 +4007,17 @@ async function setPick(agent, field, value, opt) {
   // seconds (every agent's lists are read again for it). The answer then
   // draws what the config really says; a refused pick puts the old one back.
   const was = field.value;
+  if (agent.native?.runtime === "unavailable" && field.key !== "effort" && value) {
+    const ed = el("div", "editor disconnect-ask"); ed.append(el("p", "lib-confirm", t("Aside is unavailable. Save this model for its next start?")));
+    const bar = el("div", "bar"), cancel = el("button", "text", t("Cancel")), save = el("button", "text primary", t("Save for next start"));
+    cancel.onclick = () => closeConfirmAsk(); save.onclick = async () => { save.disabled = true; try { state = await api("agents/stage/" + agent.id, { field: field.key, value }); closeConfirmAsk(); renderAgents(); } catch (err) { save.disabled = false; status(t(err.message), "err"); } };
+    bar.append(cancel, save); ed.append(bar); confirmAsk = ed; openModal(ed); return;
+  }
+  if (agent.native) {
+    try { state = await api("set", { agent: agent.id, field: field.key, value }); renderAgents(); }
+    catch (err) { status(t(err.message), "err"); }
+    return;
+  }
   const leaving = leavesMagpie(agent, field, value, opt);
   const seq = commit.seq = (commit.seq || 0) + 1;
   field.value = value;
