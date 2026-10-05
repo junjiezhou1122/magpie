@@ -2190,15 +2190,17 @@ body.window .ag-sk-icon { width: 22px; height: 22px; border-radius: 6px; }
   pointer-events: none;
 }
 .segs .thumb { border-radius: 5px; }
-/* a strip too wide for the window scrolls in itself: the regions, and
-   Connect's five APIs on a narrow one */
-.segs.regions, .connect .segs { max-width: 100%; overflow-x: auto; }
+/* a strip too wide for the window scrolls in itself: the regions,
+   Connect's five APIs on a narrow one, and Usage → Sessions' agents,
+   which #929 left widening the whole page until its last agent's
+   filter was only reachable by dragging the page sideways */
+.segs.regions, .connect .segs, #sessAgent { max-width: 100%; overflow-x: auto; }
 /* no scrollbar-width here: Chromium (WebView2) then drops every
    ::-webkit-scrollbar rule and draws Windows' classic bar, arrows and all,
    under the strip; the app's thin thumb instead, slimmer still */
-:where(body:not(.mac)) :is(.segs.regions, .connect .segs)::-webkit-scrollbar { height: 6px; }
-:where(body:not(.mac)) :is(.segs.regions, .connect .segs)::-webkit-scrollbar-thumb { border-width: 1px; }
-.segs.regions .opt, .connect .segs .opt { flex: none; }
+:where(body:not(.mac)) :is(.segs.regions, .connect .segs, #sessAgent)::-webkit-scrollbar { height: 6px; }
+:where(body:not(.mac)) :is(.segs.regions, .connect .segs, #sessAgent)::-webkit-scrollbar-thumb { border-width: 1px; }
+.segs.regions .opt, .connect .segs .opt, #sessAgent .opt { flex: none; }
 /* an installed list's order (#481): small, beside the list's heading */
 .segs.sortby { align-self: center; flex: none; }
 .segs.sortby .opt { height: 20px; padding: 0 8px; font-size: 11px; }
