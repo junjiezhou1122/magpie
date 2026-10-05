@@ -67,15 +67,16 @@ The GUI's plugin integration includes `subOf`, `pluginSubs`, and `startPluginSig
 
 Gateway parity tests in [`plugin_parity_test.go`](../../internal/gateway/plugin_parity_test.go) and other `plugin_*_test.go` files compare or exercise plugin paths. A built-in test alone does not establish moved-user behavior. Inspect each test's fixture to confirm that it covers the provider and operation being changed.
 
-Run the relevant package tests with an isolated home directory. Resolve Go's caches before changing HOME, so repeated runs reuse them. The subshell cleans up its temporary home on exit, including when tests fail, and returns the test command's exit status.
+Run the relevant package tests with an isolated home directory. Resolve GOPATH and Go's caches before changing HOME, so repeated runs reuse dependencies and downloaded toolchains. The subshell makes temporary files writable and cleans up its home on exit, including when tests fail, and returns the test command's exit status.
 
 ```sh
 (
 	verification_home=$(mktemp -d) || exit
-	trap 'rm -rf "$verification_home"' EXIT
+	trap 'chmod -R u+w "$verification_home"; rm -rf "$verification_home"' EXIT
+	verification_gopath=$(go env GOPATH) || exit
 	verification_modcache=$(go env GOMODCACHE) || exit
 	verification_buildcache=$(go env GOCACHE) || exit
-	HOME="$verification_home" GOMODCACHE="$verification_modcache" GOCACHE="$verification_buildcache" \
+	HOME="$verification_home" GOPATH="$verification_gopath" GOMODCACHE="$verification_modcache" GOCACHE="$verification_buildcache" \
 		go test -tags nogui ./internal/provider ./internal/gateway ./internal/plugin
 )
 ```
