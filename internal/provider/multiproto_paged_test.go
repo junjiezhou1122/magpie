@@ -407,12 +407,15 @@ func TestFetchOpenRouterRuleOverTheFourBaseCombinations(t *testing.T) {
 			t.Fatal(err)
 		}
 		// it is asked, and what it answers with is a page of the catalog, so
-		// the fetch fails rather than saving a page as the list
+		// the fetch fails rather than saving a page as the list. The page
+		// after that one is asked as well — the pages of a list are followed
+		// to the end of it (catalog.Paged) — and it is the same page again
+		// under the id just asked for, which is where following them ends.
 		if _, err := p.Fetch(context.Background()); err == nil {
 			t.Errorf("a page was read as the catalog: %v", fetchIDs(t, "alone"))
 		}
-		if n := asked(); n != 1 {
-			t.Errorf("asked OpenRouter's Anthropic base %d times, want once", n)
+		if n := asked(); n < 1 || n > 2 {
+			t.Errorf("asked OpenRouter's Anthropic base %d times, want the page and the one after it", n)
 		}
 	})
 

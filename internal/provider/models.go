@@ -555,9 +555,9 @@ const openRouterHost = "openrouter.ai"
 // (fetchOne). The host of the base being asked is the whole of the input:
 // another vendor's Anthropic base is merged as it always was, and one of
 // OpenRouter's under a provider that asks nowhere else is asked after all,
-// since then its reply is the only catalog there is — the pagination guard
-// in catalog.fetchOne is what keeps a page of it from being read as the
-// whole.
+// since then its reply is the only catalog there is — its pages are
+// followed to the end of the list, so it is the whole list and not one page
+// of it that is kept (catalog.fetchOne).
 func (p Provider) skipOpenRouterAnthropic(base string) bool {
 	if HostOf(base) != openRouterHost {
 		return false
