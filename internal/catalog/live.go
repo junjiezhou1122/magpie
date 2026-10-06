@@ -30,6 +30,11 @@ type liveFile struct {
 	Fetched time.Time `json:"fetched"`
 	Base    string    `json:"base"`
 	Models  []Model   `json:"models"`
+	// Sides, for a provider whose protocols are served at bases of their
+	// own, is what each of those bases listed, before the lists were
+	// merged into Models. A base that can't be asked keeps its own part
+	// from the list saved before (#904).
+	Sides map[string][]Model `json:"sides,omitempty"`
 }
 
 func readLive(provider string) (liveFile, error) {
@@ -52,6 +57,19 @@ func Live(provider string) (models []Model, fetched time.Time, ok bool) {
 		return nil, time.Time{}, false
 	}
 	return ms, f.Fetched, true
+}
+
+// LiveSplit returns the provider's fetched list as every endpoint's own part
+// of it: sides[base] is what that endpoint listed, and all is the whole list
+// those parts were merged into. ok is false where there is no list at all;
+// sides is nil for a list saved without its parts, where every endpoint
+// answered alike.
+func LiveSplit(provider string) (sides map[string][]Model, all []Model, ok bool) {
+	f, err := readLive(provider)
+	if err != nil || len(f.Models) == 0 {
+		return nil, nil, false
+	}
+	return f.Sides, f.Models, true
 }
 
 // LiveDrawers are the models in the provider's fetched list that make
@@ -99,6 +117,14 @@ func Chat(ms []Model) []Model {
 
 // SaveLive stores a fetched list; an empty list forgets it.
 func SaveLive(provider, base string, models []Model) error {
+	return SaveLiveSides(provider, base, models, nil)
+}
+
+// SaveLiveSides is SaveLive, keeping what each endpoint answered with beside
+// the merged list (LiveSplit): a provider whose protocols sit at bases of
+// their own asks every base, and a base that can't be asked next time has to
+// know which of the models were its own to keep (#904).
+func SaveLiveSides(provider, base string, models []Model, sides map[string][]Model) error {
 	p := LivePath(provider)
 	if len(models) == 0 {
 		err := os.Remove(p)
@@ -113,7 +139,7 @@ func SaveLive(provider, base string, models []Model) error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
-	b, _ := json.MarshalIndent(liveFile{Fetched: time.Now(), Base: base, Models: models}, "", "  ")
+	b, _ := json.MarshalIndent(liveFile{Fetched: time.Now(), Base: base, Models: models, Sides: sides}, "", "  ")
 	if err := os.WriteFile(p, b, 0o644); err != nil {
 		return err
 	}
