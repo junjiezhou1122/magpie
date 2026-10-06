@@ -909,7 +909,9 @@ func TestFetchDropsAModelWhileAnEndpointHasNeverAnswered(t *testing.T) {
 		if !ok {
 			t.Fatalf("round %d: no parts kept", round)
 		}
-		if _, saved := sides[anthropic.URL+"/v1"]; saved {
+		// the Anthropic base is kept as the root /v1/messages is asked at
+		// (normalize), which is the key its part is saved under
+		if _, saved := sides[anthropic.URL]; saved {
 			t.Fatalf("round %d: a part was saved for an endpoint that never answered", round)
 		}
 	}
@@ -1038,5 +1040,144 @@ func TestFetchKeepsAModelsBaseAfterItsKeyFailedWhole(t *testing.T) {
 	}
 	if !slices.Equal(picks, []string{"gpt-a"}) {
 		t.Fatalf("picks after that base answered again: %v, want gpt-a", picks)
+	}
+}
+
+// The other way round for the same rule, which is what keeps sides saying
+// what the bases listed: a model kept for a key that could not be asked at
+// all belongs to the bases that listed it, but not to one that answered
+// this round for another of the model's keys and no longer serves it. A
+// part here said the Anthropic base still served claude-b, and the fetch
+// after that read it as a base that couldn't be asked, holding a model its
+// vendor had dropped for one round longer (yetone's review of #1006, found
+// on the path TestFetchKeepsAModelsBaseAfterItsKeyFailedWhole fixed).
+//
+// It is the same two keys as that test, and the difference is in one thing:
+// there claude-b is only the second key's, so the Anthropic base never
+// listed it for the first one and its answering says nothing about it. Here
+// the first key saw claude-b too, and this round stopped being served it.
+func TestFetchDropsAModelABaseStoppedServingWhileAKeyIsDown(t *testing.T) {
+	isolate(t)
+	h := t.TempDir()
+	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
+	t.Setenv("PATH", h)
+	for _, v := range agentenv.Vars {
+		t.Setenv(v, "")
+	}
+
+	var secondDown, dropped, anthDown atomic.Bool
+	chat := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		if secondDown.Load() && r.Header.Get("Authorization") == "Bearer sk-2" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte(`{"data":[{"id":"gpt-a"}]}`))
+	}))
+	defer chat.Close()
+	// both keys are served claude-b to begin with; the drop below is the
+	// vendor stopping both of them
+	anthropic := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		if anthDown.Load() {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") == "Bearer sk-2" && secondDown.Load() {
+			http.NotFound(w, r)
+			return
+		}
+		if dropped.Load() {
+			w.Write([]byte(`{"data":[{"id":"claude-1"}]}`))
+			return
+		}
+		w.Write([]byte(`{"data":[{"id":"claude-1"},{"id":"claude-b"}]}`))
+	}))
+	defer anthropic.Close()
+
+	if err := Save(Provider{
+		ID:        "stopped",
+		Name:      "Stopped",
+		Chat:      chat.URL + "/v1",
+		Anthropic: anthropic.URL + "/v1",
+		Key:       "sk-1",
+		Keys:      []KeyAccount{{Key: "sk-2"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fetch := func() ([]string, []string) {
+		p, err := Find("stopped")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := p.Fetch(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		p, _ = Find("stopped")
+		live, _, ok := p.live()
+		if !ok {
+			t.Fatal("no list kept")
+		}
+		return idsOf(live), p.Models
+	}
+
+	// round 0: both keys see claude-b
+	got, _ := fetch()
+	if want := []string{"gpt-a", "claude-1", "claude-b"}; !slices.Equal(got, want) {
+		t.Fatalf("list after the first round: %v, want %v", got, want)
+	}
+	p, _ := Find("stopped")
+	p.Models = []string{"gpt-a", "claude-b"}
+	if err := Save(*p); err != nil {
+		t.Fatal(err)
+	}
+
+	// round 1: the second key is down at both of its bases, so claude-b is
+	// kept for it, and in the same round the Anthropic base answers for the
+	// first key without listing it. The base is not that model's any more,
+	// and no part says it is.
+	secondDown.Store(true)
+	dropped.Store(true)
+	got, _ = fetch()
+	if want := []string{"gpt-a", "claude-1", "claude-b"}; !slices.Equal(got, want) {
+		t.Fatalf("list while a key is down and the base dropped a model: %v, want %v", got, want)
+	}
+	sides, _, ok := catalog.LiveSplit("stopped")
+	if !ok {
+		t.Fatal("no parts kept")
+	}
+	if ids := idsOf(sides[anthropic.URL]); !slices.Equal(ids, []string{"claude-1"}) {
+		t.Fatalf("part of the Anthropic base: %v, want claude-1 alone", ids)
+	}
+
+	// round 2: that key is asked again and its Anthropic base is down for
+	// both keys, so nothing keeps claude-b and it is gone
+	secondDown.Store(false)
+	anthDown.Store(true)
+	got, picks := fetch()
+	if want := []string{"gpt-a", "claude-1"}; !slices.Equal(got, want) {
+		t.Fatalf("list after the base went down for every key: %v, want %v", got, want)
+	}
+	if !slices.Equal(picks, []string{"gpt-a"}) {
+		t.Fatalf("picks after the base went down for every key: %v, want gpt-a", picks)
+	}
+
+	// round 3: and it stays gone once the base answers again without it
+	anthDown.Store(false)
+	got, picks = fetch()
+	if want := []string{"gpt-a", "claude-1"}; !slices.Equal(got, want) {
+		t.Fatalf("list after the base answered again: %v, want %v", got, want)
+	}
+	if !slices.Equal(picks, []string{"gpt-a"}) {
+		t.Fatalf("picks after the base answered again: %v, want gpt-a", picks)
 	}
 }

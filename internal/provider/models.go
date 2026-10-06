@@ -409,12 +409,14 @@ func FetchNew(timeout time.Duration) {
 }
 
 // a fetched list: every endpoint's models merged, the base kept for
-// routing, and what each endpoint listed of its own (sides), so that one
-// which can't be asked keeps its own models next time (#904).
+// routing, what each endpoint listed of its own (sides), and which of them
+// answered at all, so that one which can't be asked keeps its own models
+// next time (#904).
 type fetched struct {
-	models []catalog.Model
-	base   string
-	sides  map[string][]catalog.Model
+	models   []catalog.Model
+	base     string
+	sides    map[string][]catalog.Model
+	answered map[string]bool
 }
 
 // fetchOne asks every endpoint the provider speaks with p's key, and merges
@@ -431,7 +433,7 @@ func (p Provider) fetchOne(ctx context.Context) (fetched, error) {
 		if err != nil {
 			return fetched{}, err
 		}
-		return fetched{catalog.WithDrawers(p.planModels(ms), catalog.PublicDrawers(ctx, u)), u, nil}, nil
+		return fetched{catalog.WithDrawers(p.planModels(ms), catalog.PublicDrawers(ctx, u)), u, nil, nil}, nil
 	}
 	if p.IsAzure() && (p.Chat != "" || p.Responses != "") {
 		// its deployments, asked with the key in api-key
@@ -439,7 +441,7 @@ func (p Provider) fetchOne(ctx context.Context) (fetched, error) {
 		if err != nil {
 			return fetched{}, err
 		}
-		return fetched{ms, base, nil}, nil
+		return fetched{ms, base, nil, nil}, nil
 	}
 	var errs []string
 	var out []catalog.Model
@@ -460,6 +462,7 @@ func (p Provider) fetchOne(ctx context.Context) (fetched, error) {
 	var sides []side  // the bases that answered, in the order asked
 	var dead []string // the bases that could not be asked this time
 	asked := map[string]bool{}
+	answered := map[string]bool{} // of the bases that answered, not those kept from
 	for _, proto := range p.Speaks() {
 		protoBase := p.Base(proto)
 		// Chat and Responses at one base say the same thing
@@ -488,6 +491,7 @@ func (p Provider) fetchOne(ctx context.Context) (fetched, error) {
 			sideBase = base
 		}
 		sides = append(sides, side{sideBase, ms})
+		answered[sideBase] = true
 		for _, m := range ms {
 			add(m)
 		}
@@ -518,6 +522,7 @@ func (p Provider) fetchOne(ctx context.Context) (fetched, error) {
 		catalog.WithDrawers(p.planModels(out), catalog.PublicDrawers(ctx, base)),
 		base,
 		parts,
+		answered,
 	}, nil
 }
 
@@ -788,6 +793,14 @@ func (p Provider) fetchPerKey(ctx context.Context, keys []KeyAccount) ([]catalog
 	var out []catalog.Model
 	var from [][]string // the bases that listed each model of out
 	asked := map[string]bool{}
+	// the bases each key was answered at, beside the models a key that
+	// could not be asked at all keeps and the keys that saw them last time
+	answeredBy := map[string]map[string]bool{}
+	type deadModel struct {
+		at   int
+		keys []string
+	}
+	var deadKept []deadModel
 	at := map[string]int{}
 	add := func(m catalog.Model, id string) int {
 		i, ok := at[m.ID]
@@ -815,16 +828,7 @@ func (p Provider) fetchPerKey(ctx context.Context, keys []KeyAccount) ([]catalog
 			lastErr = err
 			for _, m := range old {
 				if slices.Contains(m.Keys, id) {
-					// the parts saved beside the list say which bases
-					// listed it, and a model kept for a key that can't be
-					// asked at all is as its own base's as one kept for
-					// that base alone (#904)
-					i := add(m, id)
-					for _, b := range basesOf(oldSides, m.ID) {
-						if !slices.Contains(from[i], b) {
-							from[i] = append(from[i], b)
-						}
-					}
+					deadKept = append(deadKept, deadModel{add(m, id), m.Keys})
 				}
 			}
 			continue
@@ -839,6 +843,9 @@ func (p Provider) fetchPerKey(ctx context.Context, keys []KeyAccount) ([]catalog
 		for b := range l.sides {
 			asked[b] = true
 		}
+		if l.answered != nil {
+			answeredBy[id] = l.answered
+		}
 		// what each base listed of its own, marked on the merged models
 		// as its part, and kept out of them: a model this plan's own
 		// models (PresetDef.Only) leave out is left out here too
@@ -852,6 +859,29 @@ func (p Provider) fetchPerKey(ctx context.Context, keys []KeyAccount) ([]catalog
 	}
 	if len(out) == 0 {
 		return nil, lastErr
+	}
+	// the parts saved beside the list say which bases listed a model kept
+	// for a key that could not be asked at all, so it is as its own base's
+	// as one kept for that base alone (#904). A base that was asked this
+	// round for one of the model's own keys, and answered it without
+	// listing the model, has said what it serves today and no longer owns
+	// it: sides may only say what the bases listed (yetone's review of
+	// #1006).
+	spokeFor := func(keys []string, b string) bool {
+		for _, j := range keys {
+			if answeredBy[j][b] {
+				return true
+			}
+		}
+		return false
+	}
+	for _, d := range deadKept {
+		for _, b := range basesOf(oldSides, out[d.at].ID) {
+			if spokeFor(d.keys, b) || slices.Contains(from[d.at], b) {
+				continue
+			}
+			from[d.at] = append(from[d.at], b)
+		}
 	}
 	// the parts, where the provider was asked at more than one of its
 	// bases: a base that can't be asked keeps its own models from the list
