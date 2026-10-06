@@ -3,9 +3,11 @@ package provider
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -17,12 +19,14 @@ import (
 )
 
 // The shapes below are openrouter.ai's own, as it answered on 2026-10-06
-// (evidence/live-openrouter-probe.txt). The fields are left as they came;
-// the long descriptions are cut, as nothing here reads them.
+// (evidence/live-openrouter-probe-r5.txt). The catalog is left as it came,
+// with the long descriptions cut, as nothing here reads them.
 
 // openRouterCatalog is /api/v1/models without the Anthropic header: the
 // whole catalog, 466 ids, the Anthropic models among them under their own
-// `anthropic/` author, nothing paged.
+// `anthropic/` author, nothing paged. It is the list of ids OpenRouter
+// serves, which is what says of the two pages below that they are not
+// models.
 const openRouterCatalog = `{"data":[` +
 	`{"id":"mistralai/mistral-large-4-0","name":"Mistral: Mistral Large 4","context_length":524288,` +
 	`"architecture":{"input_modalities":["text","image"],"output_modalities":["text"],"modality":"text+image->text"}},` +
@@ -36,14 +40,53 @@ const openRouterCatalog = `{"data":[` +
 	`"architecture":{"input_modalities":["text","image","file"],"output_modalities":["text"],"modality":"text+image+file->text"}}` +
 	`],"total_count":466,"links":{"next":null}}`
 
-// openRouterNamespacedPage is /api/v1/models as it answers the Anthropic
-// version header: the catalog again, twenty newest first, every id with
-// `anthropic/` in front of it, and the cursors of the rest. None of those
-// twenty is an id in the catalog above (evidence/
-// live-openrouter-routability.txt): `anthropic/mistralai/mistral-large-4-0`
-// reads as Anthropic's own model of Mistral's slug, and
-// `openai/gpt-6.1-sol[1m]` is not an id OpenRouter serves at all.
-const openRouterNamespacedPage = `{"data":[` +
+// openRouterNamespacedCursor is where the first namespaced page ends, and
+// so the after_id the second one is asked at: the id the endpoint put in
+// last_id, which is the twenty-first of its list and the newest model in
+// it (TestOpenRouterNamespacedPagesAreTheEndpointShape reads it back off
+// the page itself, so the two cannot drift apart).
+const openRouterNamespacedCursor = "anthropic/openai/gpt-6-luna-pro[1m]"
+
+// openRouterFile is the bytes of one of the endpoint's own replies.
+func openRouterFile(t *testing.T, file string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// openRouterNamespaced is /api/v1/models as openrouter.ai answers the
+// Anthropic version header, page for page: the bytes of the two replies it
+// gave on 2026-10-06, under testdata, and nothing else. Twenty ids newest
+// first, every one with `anthropic/` in front of the vendor's own, saying
+// there is another page and where that one starts; and under that cursor
+// 413 more, saying there is none after it. The two pages have nothing in
+// common, and neither of them has anything in common with the catalog
+// above — following the list leads deeper into the namespace, never out of
+// it. A cursor the endpoint does not know answers with an empty list and
+// no has_more, as it did.
+func openRouterNamespaced(t *testing.T, after string) string {
+	t.Helper()
+	file := "testdata/openrouter-models-anthropic-1.json"
+	switch after {
+	case "":
+	case openRouterNamespacedCursor:
+		file = "testdata/openrouter-models-anthropic-2.json"
+	default:
+		return `{"data":[]}`
+	}
+	return string(openRouterFile(t, file))
+}
+
+// pagedOnceThenAgain is a list that says it has more and answers the very
+// same page again under the id just asked for — one of the four ways
+// following a list stops, and what a relay whose cursors do nothing gives.
+// The ids are the namespaced ones of the pages above, as those are the ids
+// a namespaced reply carries; what matters here is only that the second
+// answer is the first one again.
+const pagedOnceThenAgain = `{"data":[` +
 	`{"id":"anthropic/mistralai/mistral-large-4-0","type":"model","display_name":"Mistral: Mistral Large 4","max_input_tokens":524288,"max_tokens":262144,"capabilities":null},` +
 	`{"id":"anthropic/openai/gpt-6.1-sol","type":"model","display_name":"OpenAI: GPT-6.1 Sol","max_input_tokens":1050000,"max_tokens":128000,"capabilities":null},` +
 	`{"id":"anthropic/openai/gpt-6.1-sol[1m]","type":"model","display_name":"OpenAI: GPT-6.1 Sol","max_input_tokens":1050000,"max_tokens":128000,"capabilities":null},` +
@@ -102,7 +145,7 @@ func TestFetchKeepsPicksWhenAModelListIsPaginated(t *testing.T) {
 			return
 		}
 		if paged.Load() {
-			w.Write([]byte(openRouterNamespacedPage))
+			w.Write([]byte(pagedOnceThenAgain))
 			return
 		}
 		w.Write([]byte(`{"data":[{"id":"anthropic/claude-opus-5"},{"id":"claude-b"}]}`))
@@ -168,7 +211,7 @@ func TestFetchKeepsPicksWhenAModelListIsPaginated(t *testing.T) {
 // (TestFetchKeepsAnotherVendorsAnthropicList).
 func TestFetchDoesNotMergeOpenRoutersNamespacedList(t *testing.T) {
 	oneHome(t)
-	asked, urls := fakeOpenRouterCatalog(t, func() string { return openRouterNamespacedPage })
+	asked, urls := fakeOpenRouterCatalog(t, func(after string) string { return openRouterNamespaced(t, after) })
 
 	// no Preset, so the rule cannot be the preset's: it is the host the
 	// user's own Chat base sits at
@@ -254,12 +297,13 @@ func TestFetchKeepsAnotherVendorsAnthropicList(t *testing.T) {
 func TestFetchOpenRouterAddsNoNamespacedModelAndKeepsPicks(t *testing.T) {
 	oneHome(t)
 	var paged atomic.Bool
-	asked, _ := fakeOpenRouterCatalog(t, func() string {
+	asked, _ := fakeOpenRouterCatalog(t, func(after string) string {
 		if paged.Load() {
-			return openRouterNamespacedPage
+			return pagedOnceThenAgain
 		}
-		// the whole namespaced catalog: every id with `anthropic/` in front
-		return strings.ReplaceAll(openRouterNamespacedPage, `"has_more":true,`, `"has_more":false,`)
+		// the whole namespaced list: both of its pages, as the endpoint
+		// answers when asked for them in order
+		return openRouterNamespaced(t, after)
 	})
 
 	if err := Save(Provider{ID: "orr2", Name: "OpenRouter", Key: "k",
@@ -304,13 +348,106 @@ func TestFetchOpenRouterAddsNoNamespacedModelAndKeepsPicks(t *testing.T) {
 	}
 }
 
+// The two namespaced pages have to be the endpoint's own, or the tests
+// below measure a shape no endpoint has: a fake that answers every cursor
+// with the same page makes following a list stop, which is what the rule
+// of catalog.Paged was read to rely on here, and hides what the endpoint
+// really does — carry on, 413 ids deeper into the namespace, and stop
+// there. So the fixture is checked against what it is for: the twenty and
+// the 413, the cursor between them, and neither page an id OpenRouter
+// serves (evidence/live-openrouter-probe-r5.txt).
+func TestOpenRouterNamespacedPagesAreTheEndpointShape(t *testing.T) {
+	one := readOpenRouterPage(t, openRouterFile(t, "testdata/openrouter-models-anthropic-1.json"))
+	two := readOpenRouterPage(t, openRouterFile(t, "testdata/openrouter-models-anthropic-2.json"))
+	// the ids OpenRouter serves, which is what says of the two pages that
+	// they name no model of its
+	served := map[string]bool{}
+	for _, id := range readOpenRouterPage(t, []byte(openRouterCatalog)).data {
+		served[id.id] = true
+	}
+
+	if len(one.data) != 20 {
+		t.Errorf("first page: %d ids, want the endpoint's 20", len(one.data))
+	}
+	if !one.more {
+		t.Error("first page: has_more false, the endpoint answered true")
+	}
+	if len(one.data) > 0 {
+		if one.first != one.data[0].id {
+			t.Errorf("first page: first_id %q, want the first id %q", one.first, one.data[0].id)
+		}
+		if want := one.data[len(one.data)-1].id; one.last != want {
+			t.Errorf("first page: last_id %q, want the last id %q", one.last, want)
+		}
+		if one.last != openRouterNamespacedCursor {
+			t.Errorf("first page: last_id %q, want the cursor the tests page on, %q", one.last, openRouterNamespacedCursor)
+		}
+	}
+	if len(two.data) != 413 {
+		t.Errorf("page after the cursor: %d ids, want the endpoint's 413", len(two.data))
+	}
+	if two.more {
+		t.Error("page after the cursor: has_more true, the endpoint answered false — the list ends there")
+	}
+	if one.last == two.last {
+		t.Errorf("both pages end at %q, so the second answers the cursor of the first as itself", one.last)
+	}
+	seen := map[string]bool{}
+	for _, p := range []namespacedPage{one, two} {
+		for _, m := range p.data {
+			if !strings.HasPrefix(m.id, "anthropic/") {
+				t.Errorf("id %q is not namespaced, as every id of these pages is", m.id)
+			}
+			if served[m.id] {
+				t.Errorf("id %q is in the catalog OpenRouter serves, so this page is not the namespaced one", m.id)
+			}
+			if seen[m.id] {
+				t.Errorf("id %q is on both pages, and the endpoint's two share nothing", m.id)
+			}
+			seen[m.id] = true
+		}
+	}
+}
+
+// A page of the namespaced list, as much of it as a test reads: the ids,
+// and the cursors that say whether another follows.
+type namespacedPage struct {
+	data  []struct{ id string }
+	more  bool
+	first string
+	last  string
+}
+
+// readOpenRouterPage reads a reply as the endpoint gave it.
+func readOpenRouterPage(t *testing.T, raw []byte) namespacedPage {
+	t.Helper()
+	var wire struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+		HasMore bool   `json:"has_more"`
+		FirstID string `json:"first_id"`
+		LastID  string `json:"last_id"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatalf("%s: %v", raw[:min(len(raw), 40)], err)
+	}
+	var p namespacedPage
+	for _, m := range wire.Data {
+		p.data = append(p.data, struct{ id string }{m.ID})
+	}
+	p.more, p.first, p.last = wire.HasMore, wire.FirstID, wire.LastID
+	return p
+}
+
 // fakeOpenRouterCatalog answers for openrouter.ai and counts the requests
 // that carried the Anthropic version header — the ones whose reply is the
 // namespaced catalog — and every URL asked, which is what a fetch of one
-// OpenRouter provider costs. namespaced says what to answer with them; the
-// other replies are the catalog itself, and the URLs FetchAt would fall
-// back to answer as openrouter.ai did: 404, then its web page.
-func fakeOpenRouterCatalog(t *testing.T, namespaced func() string) (anthropicAsked, urls func() int32) {
+// OpenRouter provider costs. namespaced is what to answer with them, given
+// the after_id asked for, so a fake of the endpoint's shape pages with it;
+// the other replies are the catalog itself, and the URLs FetchAt would
+// fall back to answer as openrouter.ai did: 404, then its web page.
+func fakeOpenRouterCatalog(t *testing.T, namespaced func(after string) string) (anthropicAsked, urls func() int32) {
 	t.Helper()
 	var n, hits atomic.Int32
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -319,7 +456,7 @@ func fakeOpenRouterCatalog(t *testing.T, namespaced func() string) (anthropicAsk
 		case "/api/v1/models":
 			if r.Header.Get("anthropic-version") != "" {
 				n.Add(1)
-				w.Write([]byte(namespaced()))
+				w.Write([]byte(namespaced(r.URL.Query().Get("after_id"))))
 				return
 			}
 			w.Write([]byte(openRouterCatalog))
@@ -377,7 +514,7 @@ func vendorListSrv(t *testing.T, body string) *httptest.Server {
 // of them went for good).
 func TestFetchOpenRouterRuleOverTheFourBaseCombinations(t *testing.T) {
 	other := func() *httptest.Server { return vendorListSrv(t, `{"data":[{"id":"kimi-k2"}]}`) }
-	namespaced := func() string { return openRouterNamespacedPage }
+	namespaced := func(after string) string { return openRouterNamespaced(t, after) }
 
 	t.Run("both of OpenRouter's: not asked", func(t *testing.T) {
 		oneHome(t)
@@ -395,7 +532,7 @@ func TestFetchOpenRouterRuleOverTheFourBaseCombinations(t *testing.T) {
 		}
 	})
 
-	t.Run("only an Anthropic base of OpenRouter's: asked", func(t *testing.T) {
+	t.Run("only an Anthropic base of OpenRouter's: asked, and its answer refused", func(t *testing.T) {
 		oneHome(t)
 		asked, _ := fakeOpenRouterCatalog(t, namespaced)
 		if err := Save(Provider{ID: "alone", Name: "Alone", Key: "k",
@@ -406,16 +543,25 @@ func TestFetchOpenRouterRuleOverTheFourBaseCombinations(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		// it is asked, and what it answers with is a page of the catalog, so
-		// the fetch fails rather than saving a page as the list. The page
-		// after that one is asked as well — the pages of a list are followed
-		// to the end of it (catalog.Paged) — and it is the same page again
-		// under the id just asked for, which is where following them ends.
-		if _, err := p.Fetch(context.Background()); err == nil {
-			t.Errorf("a page was read as the catalog: %v", fetchIDs(t, "alone"))
+		// It is asked, since it is the only base there is. What it answers
+		// with is the namespaced list, which is not a list of models to
+		// serve: its pages are followed to the end of it (catalog.Paged) and
+		// the twenty and the 413 that come back are refused as a whole, so
+		// the fetch fails rather than saving them as the provider's models.
+		// Two requests: the page asked as the URL stands, and the one under
+		// the cursor it ended at.
+		if ms, err := p.Fetch(context.Background()); err == nil {
+			t.Errorf("the namespaced list was taken as the catalog: %d ids, first %q", len(ms), idsOf(ms)[0])
 		}
-		if n := asked(); n < 1 || n > 2 {
-			t.Errorf("asked OpenRouter's Anthropic base %d times, want the page and the one after it", n)
+		if n := asked(); n != 2 {
+			t.Errorf("asked OpenRouter's Anthropic base %d times, want the two pages it answers with", n)
+		}
+		p, err = Find("alone")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, ok := p.live(); ok {
+			t.Errorf("a list was kept for a base whose only answer is the namespaced one: %v", p.Models)
 		}
 	})
 
