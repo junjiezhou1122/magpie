@@ -501,13 +501,11 @@ func (p Provider) fetchOne(ctx context.Context) (fetched, error) {
 		return fetched{}, errorf("%s — type its model ids in by hand, or give the URL its list is at", strings.Join(errs, "; "))
 	}
 	if len(dead) > 0 {
-		kept := p.keepDeadSides(dead, sides)
-		sides = append(sides, kept...)
-		for _, s := range kept {
-			for _, m := range s.models {
-				add(m)
-			}
+		kept, saved := p.keepDeadSides(dead, sides)
+		for _, m := range kept {
+			add(m)
 		}
+		sides = append(sides, saved...)
 	}
 	// the image models its list leaves out (AIHubMix's gpt-image-2)
 	// the parts are kept only where several bases were asked: a single one
@@ -559,13 +557,25 @@ func sidesOf(sides []side) map[string][]catalog.Model {
 // saved before would bring such a model back, which is the same fault the
 // other way round (#904, yetone's review).
 //
-// A list saved without the parts (before this kept them) says nothing about
-// which base listed what, so the models no answering base lists are kept this
-// once, and the next fetch with every base answering says which they are.
-func (p Provider) keepDeadSides(dead []string, answered []side) []side {
+// A base in none of the saved parts is one that has never answered, and
+// keeps nothing: the whole list saved before is not its own. Reading an
+// absent part as the whole list kept a model its vendor had already
+// dropped, and then saved that guess as what the base listed, so from then
+// on the model was a base's own and could never be dropped again (#904,
+// yetone's review of #1006).
+//
+// A list saved without its parts (before this kept them) says nothing about
+// which base listed what, so the models no answering base lists are kept
+// this once, and the next fetch with every base answering says which they
+// are.
+//
+// kept are the models this fetch's list is made of, saved the parts to
+// write beside it: not every base kept from is saved, only one whose part
+// was read out of the file rather than stood in for.
+func (p Provider) keepDeadSides(dead []string, answered []side) (kept []catalog.Model, saved []side) {
 	old, last, ok := catalog.LiveSplit(p.ID)
 	if !ok || len(last) == 0 {
-		return nil
+		return nil, nil
 	}
 	listed := map[string]bool{}
 	for _, s := range answered {
@@ -582,19 +592,27 @@ func (p Provider) keepDeadSides(dead []string, answered []side) []side {
 	for _, base := range dead {
 		own, had := old[base]
 		if !had {
-			// no part saved for this base: what no answering base lists
-			// is kept this once
+			if old != nil {
+				// the parts are saved and this base is in none of them: it
+				// has never answered, so it has no models of its own
+				continue
+			}
+			// no parts at all: what no answering base lists is kept, this
+			// once, and not saved as this base's own
 			own = last
 		}
-		var kept []catalog.Model
+		var part []catalog.Model
 		for _, m := range own {
 			if (had || !listed[m.ID]) && mine(m) {
-				kept = append(kept, m)
+				part = append(part, m)
 			}
 		}
-		out = append(out, side{base, kept})
+		kept = append(kept, part...)
+		if had {
+			out = append(out, side{base, part})
+		}
 	}
-	return out
+	return kept, out
 }
 
 // listRegion reports whether the provider sits at one of its preset's
@@ -766,11 +784,12 @@ func (p Provider) fetchPerKey(ctx context.Context, keys []KeyAccount) ([]catalog
 	old, _, _ := catalog.Live(p.ID)
 	old = append(old, catalog.LiveDrawers(p.ID)...)
 	old = append(old, catalog.LiveVideomakers(p.ID)...)
+	oldSides, _, _ := catalog.LiveSplit(p.ID)
 	var out []catalog.Model
 	var from [][]string // the bases that listed each model of out
 	asked := map[string]bool{}
 	at := map[string]int{}
-	add := func(m catalog.Model, id string) {
+	add := func(m catalog.Model, id string) int {
 		i, ok := at[m.ID]
 		if !ok {
 			m.Keys = nil
@@ -784,6 +803,7 @@ func (p Provider) fetchPerKey(ctx context.Context, keys []KeyAccount) ([]catalog
 		if !slices.Contains(out[i].Keys, id) {
 			out[i].Keys = append(out[i].Keys, id)
 		}
+		return i
 	}
 	var base string
 	var lastErr error
@@ -795,7 +815,16 @@ func (p Provider) fetchPerKey(ctx context.Context, keys []KeyAccount) ([]catalog
 			lastErr = err
 			for _, m := range old {
 				if slices.Contains(m.Keys, id) {
-					add(m, id)
+					// the parts saved beside the list say which bases
+					// listed it, and a model kept for a key that can't be
+					// asked at all is as its own base's as one kept for
+					// that base alone (#904)
+					i := add(m, id)
+					for _, b := range basesOf(oldSides, m.ID) {
+						if !slices.Contains(from[i], b) {
+							from[i] = append(from[i], b)
+						}
+					}
 				}
 			}
 			continue
@@ -842,6 +871,23 @@ func (p Provider) fetchPerKey(ctx context.Context, keys []KeyAccount) ([]catalog
 		}
 	}
 	return catalog.Chat(out), catalog.SaveLiveSides(p.ID, base, out, sides)
+}
+
+// basesOf are the saved parts that listed a model: where a model a failed
+// key kept out of the list saved before came from, and so which base keeps
+// it the next time that base is the one that can't be asked (#904).
+func basesOf(sides map[string][]catalog.Model, id string) []string {
+	var out []string
+	for b, ms := range sides {
+		for _, m := range ms {
+			if m.ID == id {
+				out = append(out, b)
+				break
+			}
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // An explicit text-only answer wins. Without one, an unknown answer stays
