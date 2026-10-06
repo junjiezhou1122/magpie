@@ -408,7 +408,12 @@ func FetchNew(timeout time.Duration) {
 	}
 }
 
-// fetchOne asks the first endpoint that answers, with p's key.
+// fetchOne asks every endpoint the provider speaks with p's key, and merges
+// the lists (#904): a vendor serves its models on several protocols, and
+// each protocol's base lists its own (Kimi's Claude models at its Anthropic
+// base, its GPT models at its Chat base). Keeping only the first list that
+// answered left every other endpoint's models out of the catalog, and so out
+// of the agents' model lists and of a model's own protocol setting.
 func (p Provider) fetchOne(ctx context.Context) ([]catalog.Model, string, error) {
 	if u := strings.TrimSpace(p.ModelsURL); u != "" {
 		// asked where the user said, and nowhere else: the base URLs
@@ -424,27 +429,58 @@ func (p Provider) fetchOne(ctx context.Context) ([]catalog.Model, string, error)
 		return p.azureModels(ctx)
 	}
 	var errs []string
+	var out []catalog.Model
+	byID := map[string]int{}
+	add := func(m catalog.Model) {
+		i, ok := byID[m.ID]
+		if !ok {
+			byID[m.ID], i = len(out), len(out)
+			out = append(out, m)
+			return
+		}
+		// a model of both protocols' lists is one model: its image
+		// capability is merged as the keys' lists are merged
+		out[i].ImageInput = sharedImageInput(out[i].ImageInput, m.ImageInput)
+		out[i].Images = out[i].Images && m.Images
+	}
+	var base string
+	asked := map[string]bool{}
 	for _, proto := range p.Speaks() {
-		base := p.Base(proto)
-		ms, at, err := catalog.FetchAt(ctx, base, p.Key, proto == Anthropic, p.listHeaders())
-		if err == nil {
-			if proto != Anthropic {
-				base = p.fixV1(base, at)
-			}
-			// the image models its list leaves out (AIHubMix's gpt-image-2)
-			return catalog.WithDrawers(p.planModels(ms), catalog.PublicDrawers(ctx, base)), base, nil
-		}
+		protoBase := p.Base(proto)
 		// Chat and Responses at one base say the same thing
-		if !slices.Contains(errs, err.Error()) {
-			errs = append(errs, err.Error())
+		if asked[protoBase] {
+			continue
+		}
+		asked[protoBase] = true
+		ms, u, err := catalog.FetchAt(ctx, protoBase, p.Key, proto == Anthropic, p.listHeaders())
+		if err != nil {
+			if !slices.Contains(errs, err.Error()) {
+				errs = append(errs, err.Error())
+			}
+			continue
+		}
+		if base == "" {
+			// the first protocol that answered keeps the base: the drawer
+			// list is fetched beside it, and it is saved with the models
+			base = protoBase
+			if proto != Anthropic {
+				base = p.fixV1(base, u)
+			}
+		}
+		for _, m := range ms {
+			add(m)
 		}
 	}
-	if len(errs) == 0 {
-		return nil, "", errorf("%s has no endpoint to ask", p.Name)
+	if base == "" {
+		if len(errs) == 0 {
+			return nil, "", errorf("%s has no endpoint to ask", p.Name)
+		}
+		// the endpoints are kept as they were: a vendor with no list (or one
+		// that wants what the key can't give) still serves the models typed in
+		return nil, "", errorf("%s — type its model ids in by hand, or give the URL its list is at", strings.Join(errs, "; "))
 	}
-	// the endpoints are kept as they were: a vendor with no list (or one
-	// that wants what the key can't give) still serves the models typed in
-	return nil, "", errorf("%s — type its model ids in by hand, or give the URL its list is at", strings.Join(errs, "; "))
+	// the image models its list leaves out (AIHubMix's gpt-image-2)
+	return catalog.WithDrawers(p.planModels(out), catalog.PublicDrawers(ctx, base)), base, nil
 }
 
 // listRegion reports whether the provider sits at one of its preset's
