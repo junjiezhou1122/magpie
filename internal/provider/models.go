@@ -474,7 +474,10 @@ func (p Provider) fetchOne(ctx context.Context) (fetched, error) {
 		// from (2026-10-06, #904). What the rule reads is the base being
 		// asked, not the provider's other bases: a Chat base of
 		// OpenRouter's says nothing of an Anthropic base that belongs to
-		// another vendor, whose models are merged as they are.
+		// another vendor, whose models are merged as they are. One of
+		// OpenRouter's asked because it is the only base there is is asked
+		// after all, and refused with what it answers
+		// (openRouterNamespacedErr).
 		if proto == Anthropic && p.skipOpenRouterAnthropic(protoBase) {
 			continue
 		}
@@ -484,6 +487,11 @@ func (p Provider) fetchOne(ctx context.Context) (fetched, error) {
 		}
 		asked[protoBase] = true
 		ms, u, err := catalog.FetchAt(ctx, protoBase, p.Key, proto == Anthropic, p.listHeaders())
+		if err == nil && proto == Anthropic && HostOf(protoBase) == openRouterHost {
+			// the pages of the list are followed to its end, and what
+			// comes back is still not a list of models to serve
+			err = openRouterNamespacedErr(protoBase)
+		}
 		if err != nil {
 			if !slices.Contains(errs, err.Error()) {
 				errs = append(errs, err.Error())
@@ -549,15 +557,39 @@ type side struct {
 // Anthropic version header with a namespaced re-listing of the catalog.
 const openRouterHost = "openrouter.ai"
 
+// openRouterNamespacedErr says why the list OpenRouter's Anthropic base
+// answers with is not one to serve. The header asks for Anthropic's own
+// catalog, and OpenRouter answers with its catalog namespaced under
+// `anthropic/` instead: the twenty newest first, and under the cursor that
+// page ends at, 413 more with nothing after them
+// (2026-10-06, evidence/live-openrouter-probe-r5.txt). Following the pages
+// to the end of it (catalog.Paged) therefore lands deeper in the
+// namespace, not back at the catalog it came from: the twenty and the 413
+// have nothing in common, and of the whole 433 four are ids in the
+// catalog OpenRouter serves without the header (its 466), the other 429
+// name no model it can be asked for. So a list read whole is no better a
+// catalog than a page of it — the whole namespaced list, where the rule
+// used to keep the twenty — and a provider whose only base is that one is
+// left with the models it listed last time, as it is for any base it could
+// not ask (#904).
+//
+// The remedy is left to the caller, which tells the user to give the
+// provider the URL its list is at: a Chat base of OpenRouter's serves that
+// same catalog under the ids it serves.
+func openRouterNamespacedErr(base string) error {
+	return fmt.Errorf("%s: with the Anthropic version header this base answers with OpenRouter's own "+
+		"catalog, every id of it namespaced under `anthropic/` — 433 of them, of which 4 are ids "+
+		"OpenRouter serves — which is not a list of models to serve", base)
+}
+
 // skipOpenRouterAnthropic reports whether the Anthropic base at base is
 // one of OpenRouter's, whose reply is its own catalog namespaced and of no
 // use to the union, and the provider asks at a base of its own besides it
 // (fetchOne). The host of the base being asked is the whole of the input:
 // another vendor's Anthropic base is merged as it always was, and one of
-// OpenRouter's under a provider that asks nowhere else is asked after all,
-// since then its reply is the only catalog there is — its pages are
-// followed to the end of the list, so it is the whole list and not one page
-// of it that is kept (catalog.fetchOne).
+// OpenRouter's under a provider that asks nowhere else is asked after all —
+// there is then no other list to take, so it is asked rather than left
+// unanswered, and refused with what it answers (openRouterNamespacedErr).
 func (p Provider) skipOpenRouterAnthropic(base string) bool {
 	if HostOf(base) != openRouterHost {
 		return false
