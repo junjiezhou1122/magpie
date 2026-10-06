@@ -330,15 +330,167 @@ func fakeOpenRouterCatalog(t *testing.T, namespaced func() string) (anthropicAsk
 		}
 	}))
 	t.Cleanup(srv.Close)
-	addr := srv.Listener.Addr().String()
+	routeOpenRouterHost(t, srv.Listener.Addr().String())
+	return n.Load, hits.Load
+}
+
+// routeOpenRouterHost points openrouter.ai at addr and leaves every other host
+// to be dialed as written, so a second vendor of a test can be served by its
+// own server in the same fetch.
+func routeOpenRouterHost(t *testing.T, addr string) {
+	t.Helper()
 	tr := &http.Transport{
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, addr)
+		DialContext: func(ctx context.Context, network, host string) (net.Conn, error) {
+			if h, _, err := net.SplitHostPort(host); err == nil && strings.EqualFold(h, openRouterHost) {
+				return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, addr)
+			}
+			return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, host)
 		},
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 	old := http.DefaultClient.Transport
 	http.DefaultClient.Transport = tr
 	t.Cleanup(func() { http.DefaultClient.Transport = old })
-	return n.Load, hits.Load
+}
+
+// listSrv serves body at /v1/models, as a vendor's own base does.
+func vendorListSrv(t *testing.T, body string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// The four ways an Anthropic base and a Chat base can sit with respect to
+// openrouter.ai, one assertion each. What decides the skip is the host of
+// the base being asked, and whether the provider asks at a base of its own
+// besides it — never the other base (moPS-42's finding on 0fb16990, where
+// reading the Chat base's host skipped an Anthropic base of another
+// vendor's: its models were in neither the union nor the sides nor the
+// bases that could not be asked, so no path kept them and the user's picks
+// of them went for good).
+func TestFetchOpenRouterRuleOverTheFourBaseCombinations(t *testing.T) {
+	other := func() *httptest.Server { return vendorListSrv(t, `{"data":[{"id":"kimi-k2"}]}`) }
+	namespaced := func() string { return openRouterNamespacedPage }
+
+	t.Run("both of OpenRouter's: not asked", func(t *testing.T) {
+		oneHome(t)
+		asked, _ := fakeOpenRouterCatalog(t, namespaced)
+		if err := Save(Provider{ID: "both", Name: "Both", Key: "k",
+			Chat: "https://openrouter.ai/api/v1", Anthropic: "https://openrouter.ai/api"}); err != nil {
+			t.Fatal(err)
+		}
+		ms := fetchIDs(t, "both")
+		if n := asked(); n != 0 {
+			t.Errorf("asked OpenRouter's Anthropic base %d times, want none", n)
+		}
+		if want := []string{"mistralai/mistral-large-4-0", "openai/gpt-6.1-sol", "anthropic/claude-sonnet-5.5", "anthropic/claude-sonnet-5.5:batch", "anthropic/claude-opus-5"}; !slices.Equal(ms, want) {
+			t.Errorf("list %v, want the catalog alone, %v", ms, want)
+		}
+	})
+
+	t.Run("only an Anthropic base of OpenRouter's: asked", func(t *testing.T) {
+		oneHome(t)
+		asked, _ := fakeOpenRouterCatalog(t, namespaced)
+		if err := Save(Provider{ID: "alone", Name: "Alone", Key: "k",
+			Anthropic: "https://openrouter.ai/api"}); err != nil {
+			t.Fatal(err)
+		}
+		p, err := Find("alone")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// it is asked, and what it answers with is a page of the catalog, so
+		// the fetch fails rather than saving a page as the list
+		if _, err := p.Fetch(context.Background()); err == nil {
+			t.Errorf("a page was read as the catalog: %v", fetchIDs(t, "alone"))
+		}
+		if n := asked(); n != 1 {
+			t.Errorf("asked OpenRouter's Anthropic base %d times, want once", n)
+		}
+	})
+
+	t.Run("Chat of OpenRouter's, an Anthropic base of another: asked", func(t *testing.T) {
+		oneHome(t)
+		asked, _ := fakeOpenRouterCatalog(t, namespaced)
+		vendor := other()
+		if err := Save(Provider{ID: "mix", Name: "Mix", Key: "k",
+			Chat: "https://openrouter.ai/api/v1", Anthropic: vendor.URL + "/v1"}); err != nil {
+			t.Fatal(err)
+		}
+		ms := fetchIDs(t, "mix")
+		if n := asked(); n != 0 {
+			t.Errorf("asked OpenRouter's Anthropic base %d times, want none", n)
+		}
+		if !slices.Contains(ms, "kimi-k2") {
+			t.Errorf("the other vendor's model missing from the union %v", ms)
+		}
+	})
+
+	t.Run("a Chat base of another, an Anthropic base of OpenRouter's: not asked", func(t *testing.T) {
+		oneHome(t)
+		asked, _ := fakeOpenRouterCatalog(t, namespaced)
+		vendor := other()
+		if err := Save(Provider{ID: "swap", Name: "Swap", Key: "k",
+			Chat: vendor.URL + "/v1", Anthropic: "https://openrouter.ai/api"}); err != nil {
+			t.Fatal(err)
+		}
+		ms := fetchIDs(t, "swap")
+		if n := asked(); n != 0 {
+			t.Errorf("asked OpenRouter's Anthropic base %d times, want none", n)
+		}
+		// the other vendor's models, and nothing of the namespaced page.
+		// OpenRouter's catalog is not this provider's: the base that could
+		// have given it answers with a page of namespaced ids, of which
+		// none is a model it serves, so none was ever there to keep.
+		if want := []string{"kimi-k2"}; !slices.Equal(ms, want) {
+			t.Errorf("list %v, want %v", ms, want)
+		}
+	})
+
+	// A Responses base lists models the same way a Chat one does, so it is
+	// the same "asked at a base of its own besides it" (fetchOne asks Chat
+	// and Responses at one base once between them).
+	t.Run("a Responses base of OpenRouter's, and no Chat: not asked", func(t *testing.T) {
+		oneHome(t)
+		asked, _ := fakeOpenRouterCatalog(t, namespaced)
+		if err := Save(Provider{ID: "resp", Name: "Resp", Key: "k",
+			Responses: "https://openrouter.ai/api/v1", Anthropic: "https://openrouter.ai/api"}); err != nil {
+			t.Fatal(err)
+		}
+		ms := fetchIDs(t, "resp")
+		if n := asked(); n != 0 {
+			t.Errorf("asked OpenRouter's Anthropic base %d times, want none", n)
+		}
+		if want := []string{"mistralai/mistral-large-4-0", "openai/gpt-6.1-sol", "anthropic/claude-sonnet-5.5", "anthropic/claude-sonnet-5.5:batch", "anthropic/claude-opus-5"}; !slices.Equal(ms, want) {
+			t.Errorf("list %v, want the catalog alone, %v", ms, want)
+		}
+	})
+}
+
+// fetchIDs is one fetch of a saved provider's list, as ids.
+func fetchIDs(t *testing.T, id string) []string {
+	t.Helper()
+	p, err := Find(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Fetch(context.Background()); err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	p, err = Find(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, _, ok := p.live()
+	if !ok {
+		return nil
+	}
+	return idsOf(live)
 }

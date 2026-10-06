@@ -465,14 +465,17 @@ func (p Provider) fetchOne(ctx context.Context) (fetched, error) {
 	answered := map[string]bool{} // of the bases that answered, not those kept from
 	for _, proto := range p.Speaks() {
 		protoBase := p.Base(proto)
-		// OpenRouter's Anthropic base is not asked for the list: with the
-		// Anthropic version header its /models answers with the catalog
-		// again, twenty newest first, every id namespaced under
-		// `anthropic/` — ids OpenRouter does not serve, so merged they are
-		// entries of the model picker that name no model, and a cluttered
-		// list to choose from (2026-10-06, #904). Its Chat base is that
-		// catalog, whole.
-		if proto == Anthropic && p.chatAtOpenRouter() {
+		// OpenRouter's Anthropic base is not asked for the list, when the
+		// provider asks at another base: with the Anthropic version header
+		// OpenRouter's /models answers with its own catalog again, twenty
+		// newest first, every id namespaced under `anthropic/` — ids
+		// OpenRouter does not serve, so merged they are entries of the
+		// model picker that name no model, and a cluttered list to choose
+		// from (2026-10-06, #904). What the rule reads is the base being
+		// asked, not the provider's other bases: a Chat base of
+		// OpenRouter's says nothing of an Anthropic base that belongs to
+		// another vendor, whose models are merged as they are.
+		if proto == Anthropic && p.skipOpenRouterAnthropic(protoBase) {
 			continue
 		}
 		// Chat and Responses at one base say the same thing
@@ -543,16 +546,23 @@ type side struct {
 }
 
 // openRouterHost is OpenRouter's, whose Anthropic base answers the
-// Anthropic version header with a namespaced re-listing of the catalog its
-// Chat base gives, and so is not asked for the model list: see fetchOne.
-// A provider of it that serves no Chat base still asks it, since then the
-// catalog is nowhere else.
+// Anthropic version header with a namespaced re-listing of the catalog.
 const openRouterHost = "openrouter.ai"
 
-// chatAtOpenRouter reports whether p's Chat base is OpenRouter's, which is
-// the whole of what makes its Anthropic base worth skipping above.
-func (p Provider) chatAtOpenRouter() bool {
-	return strings.TrimSpace(p.Chat) != "" && HostOf(p.Chat) == openRouterHost
+// skipOpenRouterAnthropic reports whether the Anthropic base at base is
+// one of OpenRouter's, whose reply is its own catalog namespaced and of no
+// use to the union, and the provider asks at a base of its own besides it
+// (fetchOne). The host of the base being asked is the whole of the input:
+// another vendor's Anthropic base is merged as it always was, and one of
+// OpenRouter's under a provider that asks nowhere else is asked after all,
+// since then its reply is the only catalog there is — the pagination guard
+// in catalog.fetchOne is what keeps a page of it from being read as the
+// whole.
+func (p Provider) skipOpenRouterAnthropic(base string) bool {
+	if HostOf(base) != openRouterHost {
+		return false
+	}
+	return strings.TrimSpace(p.Chat) != "" || strings.TrimSpace(p.Responses) != ""
 }
 
 // sidesOf is what each base listed, for the fetch to be saved with. A base
