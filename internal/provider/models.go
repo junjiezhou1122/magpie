@@ -548,6 +548,16 @@ func (p Provider) fetchOne(ctx context.Context) (fetched, error) {
 		if proto == Anthropic {
 			lctx = p.listAuth(ctx) // a vendor that takes one key header alone
 		}
+		// OpenRouter's Anthropic base is not asked for the list: with the
+		// Anthropic version header its /models answers with the catalog
+		// again, twenty newest first, every id namespaced under
+		// `anthropic/` — ids OpenRouter does not serve, so merged they are
+		// entries of the model picker that name no model, and a cluttered
+		// list to choose from (2026-10-06, #904). Its Chat base is that
+		// catalog, whole.
+		if proto == Anthropic && p.chatAtOpenRouter() {
+			continue
+		}
 		// Chat and Responses at one base say the same thing
 		if asked[protoBase] {
 			continue
@@ -613,6 +623,19 @@ func (p Provider) fetchOne(ctx context.Context) (fetched, error) {
 type side struct {
 	base   string
 	models []catalog.Model
+}
+
+// openRouterHost is OpenRouter's, whose Anthropic base answers the
+// Anthropic version header with a namespaced re-listing of the catalog its
+// Chat base gives, and so is not asked for the model list: see fetchOne.
+// A provider of it that serves no Chat base still asks it, since then the
+// catalog is nowhere else.
+const openRouterHost = "openrouter.ai"
+
+// chatAtOpenRouter reports whether p's Chat base is OpenRouter's, which is
+// the whole of what makes its Anthropic base worth skipping above.
+func (p Provider) chatAtOpenRouter() bool {
+	return strings.TrimSpace(p.Chat) != "" && HostOf(p.Chat) == openRouterHost
 }
 
 // sidesOf is what each base listed, for the fetch to be saved with. A base

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"sync/atomic"
 	"testing"
 
 	"github.com/yetone/magpie/internal/catalog"
@@ -102,6 +103,61 @@ func TestKiloModels(t *testing.T) {
 	o, _ := FromPreset("together")
 	if o.kiloFreeModel("qwen/qwen3.8-27b:free") {
 		t.Fatal("kiloFreeModel on another provider")
+	}
+}
+
+// A page of the gateway's list is not the list: the gateway's shape is
+// OpenRouter's, which pages with has_more and last_id, and a reply read as
+// the whole one drops every model of a later page from the user's picks
+// (#904). The fetch says so instead, and the picks are left alone.
+func TestKiloModelsRefuseAPageOfTheList(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	var paged atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/openrouter/models" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if paged.Load() {
+			w.Write([]byte(`{"data":[` +
+				`{"id":"kilo-auto/free","name":"Auto Free","context_length":256000,"supported_parameters":["tools"],"isFree":true}` +
+				`],"has_more":true,"first_id":"kilo-auto/free","last_id":"kilo-auto/free"}`))
+			return
+		}
+		w.Write([]byte(kiloList))
+	}))
+	defer srv.Close()
+	p, err := FromPreset("kilo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.ID, p.Chat, p.Key = "kilo-page", srv.URL+"/api/openrouter", "kilo_jwt"
+	if err := Save(p); err != nil {
+		t.Fatal(err)
+	}
+	q, _ := Find("kilo-page")
+	if _, err := q.Fetch(context.Background()); err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	q, _ = Find("kilo-page")
+	q.Models = []string{"kilo-auto/free", "stealth/space-bunny-alpha"}
+	if err := Save(*q); err != nil {
+		t.Fatal(err)
+	}
+
+	// the second list leaves out a model the first one had, because it is
+	// a page: the fetch says so and takes nothing away
+	paged.Store(true)
+	if _, dropped, err := q.Refetch(context.Background()); err == nil {
+		t.Fatal("a page of the list was read as the whole list")
+	} else if len(dropped) != 0 {
+		t.Errorf("dropped %v, want none", dropped)
+	}
+	q, _ = Find("kilo-page")
+	if !slices.Equal(q.Models, []string{"kilo-auto/free", "stealth/space-bunny-alpha"}) {
+		t.Errorf("picks: %v, want the two that were picked", q.Models)
 	}
 }
 
