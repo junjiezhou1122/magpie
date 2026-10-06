@@ -811,3 +811,232 @@ func TestFetchKeepsModelsOfAListSavedWithoutParts(t *testing.T) {
 		t.Fatalf("picks after every base answered: %v, want %v", p.Models, want)
 	}
 }
+
+// An endpoint that has never answered keeps nothing. The parts saved with
+// the list say which endpoint listed what, and an endpoint in none of them
+// is one that never answered: the whole list saved before is not its own,
+// and a model the endpoint that does answer has dropped is gone, however
+// many rounds the other one stays at 404. Reading an absent part as an
+// empty one instead fixed that guess as what the endpoint listed, and the
+// model could never be dropped again (#904, yetone's review of #1006).
+func TestFetchDropsAModelWhileAnEndpointHasNeverAnswered(t *testing.T) {
+	isolate(t)
+	h := t.TempDir()
+	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
+	t.Setenv("PATH", h)
+	for _, v := range agentenv.Vars {
+		t.Setenv(v, "")
+	}
+
+	var list atomic.Value
+	list.Store(`{"data":[{"id":"gpt-a"},{"id":"gpt-b"}]}`)
+	chat := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte(list.Load().(string)))
+	}))
+	defer chat.Close()
+	// the Anthropic base never answers, from the first round on: no part
+	// of the list is ever its own
+	anthropic := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer anthropic.Close()
+
+	if err := Save(Provider{
+		ID:        "never",
+		Name:      "Never",
+		Chat:      chat.URL + "/v1",
+		Anthropic: anthropic.URL + "/v1",
+		Key:       "sk-n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fetch := func() error {
+		p, err := Find("never")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = p.Fetch(context.Background())
+		return err
+	}
+	// round 0: both models listed by the one endpoint that answers, and
+	// both picked
+	if err := fetch(); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := Find("never")
+	p.Models = []string{"gpt-a", "gpt-b"}
+	if err := Save(*p); err != nil {
+		t.Fatal(err)
+	}
+	live, _, ok := p.live()
+	if !ok {
+		t.Fatal("no list kept after the first round")
+	}
+	if ids, want := idsOf(live), []string{"gpt-a", "gpt-b"}; !slices.Equal(ids, want) {
+		t.Fatalf("list after the first round: %v", ids)
+	}
+
+	// the Chat base has dropped gpt-b. The Anthropic base, which never
+	// answered, has no say in it: it is gone from the second round on, and
+	// stays gone however long that base keeps answering 404.
+	list.Store(`{"data":[{"id":"gpt-a"}]}`)
+	for round := 1; round <= 4; round++ {
+		if err := fetch(); err != nil {
+			t.Fatalf("round %d: %v", round, err)
+		}
+		p, _ = Find("never")
+		if want := []string{"gpt-a"}; !slices.Equal(p.Models, want) {
+			t.Fatalf("round %d picks: %v, want %v", round, p.Models, want)
+		}
+		live, _, ok = p.live()
+		if !ok {
+			t.Fatalf("round %d: no list kept", round)
+		}
+		if ids, want := idsOf(live), []string{"gpt-a"}; !slices.Equal(ids, want) {
+			t.Fatalf("round %d list: %v, want %v", round, ids, want)
+		}
+		// an endpoint that never answered is not saved as one that listed
+		// nothing: it has said nothing at all, and a part here would be a
+		// guess fixed as what it listed
+		sides, _, ok := catalog.LiveSplit("never")
+		if !ok {
+			t.Fatalf("round %d: no parts kept", round)
+		}
+		if _, saved := sides[anthropic.URL+"/v1"]; saved {
+			t.Fatalf("round %d: a part was saved for an endpoint that never answered", round)
+		}
+	}
+}
+
+// A key that can't be asked at any of its bases keeps the models it saw
+// last time, and they keep the bases that listed them: the next time that
+// key answers at its Chat base while its Anthropic base is still down, the
+// Claude model only that key saw is that base's own, and is kept as a
+// single key's failed base is. Kept as a whole list with no part saying
+// where it came from it belongs to no base at all, and is read as gone the
+// first time that key answers half-way (#904, yetone's review of #1006).
+func TestFetchKeepsAModelsBaseAfterItsKeyFailedWhole(t *testing.T) {
+	isolate(t)
+	h := t.TempDir()
+	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
+	t.Setenv("PATH", h)
+	for _, v := range agentenv.Vars {
+		t.Setenv(v, "")
+	}
+
+	// each key has a Claude model of its own, so claude-b is one base's own
+	// and of the second key alone
+	var chatDown, anthropicDown, swapped atomic.Bool
+	chat := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		if chatDown.Load() && r.Header.Get("Authorization") == "Bearer sk-2" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte(`{"data":[{"id":"gpt-a"}]}`))
+	}))
+	defer chat.Close()
+	anthropic := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer sk-2" {
+			w.Write([]byte(`{"data":[{"id":"claude-1"}]}`))
+			return
+		}
+		if anthropicDown.Load() {
+			http.NotFound(w, r)
+			return
+		}
+		if swapped.Load() {
+			w.Write([]byte(`{"data":[{"id":"claude-c"}]}`))
+			return
+		}
+		w.Write([]byte(`{"data":[{"id":"claude-b"}]}`))
+	}))
+	defer anthropic.Close()
+
+	if err := Save(Provider{
+		ID:        "wholekey",
+		Name:      "Whole key",
+		Chat:      chat.URL + "/v1",
+		Anthropic: anthropic.URL + "/v1",
+		Key:       "sk-1",
+		Keys:      []KeyAccount{{Key: "sk-2"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fetch := func() ([]string, []string) {
+		p, err := Find("wholekey")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := p.Fetch(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		p, _ = Find("wholekey")
+		live, _, ok := p.live()
+		if !ok {
+			t.Fatal("no list kept")
+		}
+		return idsOf(live), p.Models
+	}
+	all := []string{"gpt-a", "claude-1", "claude-b"}
+
+	// round 0: every base of every key answers
+	got, _ := fetch()
+	if !slices.Equal(got, all) {
+		t.Fatalf("list after the first round: %v, want %v", got, all)
+	}
+	p, _ := Find("wholekey")
+	p.Models = []string{"gpt-a", "claude-b"}
+	if err := Save(*p); err != nil {
+		t.Fatal(err)
+	}
+
+	// round 1: the second key can't be asked at any of its bases, so its
+	// Claude model is kept from the list saved before
+	chatDown.Store(true)
+	anthropicDown.Store(true)
+	got, _ = fetch()
+	if !slices.Equal(got, all) {
+		t.Fatalf("list after the second key failed whole: %v, want %v", got, all)
+	}
+
+	// round 2: that key answers at its Chat base again while its Anthropic
+	// base is still down
+	chatDown.Store(false)
+	got, picks := fetch()
+	if !slices.Equal(got, all) {
+		t.Fatalf("list after the second key answered half-way: %v, want %v", got, all)
+	}
+	if !slices.Equal(picks, []string{"gpt-a", "claude-b"}) {
+		t.Fatalf("picks after the second key answered half-way: %v, want gpt-a and claude-b", picks)
+	}
+
+	// round 3: that key's Anthropic base answers again and has dropped the
+	// model, which is then gone: keeping it is not keeping it for good
+	anthropicDown.Store(false)
+	swapped.Store(true)
+	got, picks = fetch()
+	if want := []string{"gpt-a", "claude-1", "claude-c"}; !slices.Equal(got, want) {
+		t.Fatalf("list after that base answered again: %v, want %v", got, want)
+	}
+	if !slices.Equal(picks, []string{"gpt-a"}) {
+		t.Fatalf("picks after that base answered again: %v, want gpt-a", picks)
+	}
+}
