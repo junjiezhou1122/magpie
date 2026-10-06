@@ -105,9 +105,18 @@ func (p Provider) kiloModels(ctx context.Context) ([]catalog.Model, string, erro
 				Output []string `json:"output_modalities"`
 			} `json:"architecture"`
 		} `json:"data"`
+		// the gateway's shape is OpenRouter's, and OpenRouter's /models
+		// pages with has_more and last_id: a page is not the list, and read
+		// as one it drops every model of a later page from the user's picks
+		// (catalog.fetchOne, and #904)
+		HasMore bool   `json:"has_more"`
+		LastID  string `json:"last_id"`
 	}
 	if err := json.Unmarshal(b, &list); err != nil {
 		return nil, base, errorf("%s: not a model list", u)
+	}
+	if list.HasMore {
+		return nil, base, errorf("%s: only a page of the model list (has_more, last id %q), not the whole list", u, list.LastID)
 	}
 	num := func(v any) int {
 		if n, ok := v.(float64); ok && n > 0 {

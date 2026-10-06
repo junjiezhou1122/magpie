@@ -293,8 +293,10 @@ func fetchOne(ctx context.Context, url, key string, anthropic bool, headers map[
 		return nil, fmt.Errorf("%s: %s", url, res.Status)
 	}
 	var v struct {
-		Data   []liveModel `json:"data"`
-		Models []liveModel `json:"models"`
+		Data    []liveModel `json:"data"`
+		Models  []liveModel `json:"models"`
+		HasMore bool        `json:"has_more"`
+		LastID  string      `json:"last_id"`
 	}
 	if err := json.Unmarshal(b, &v); err != nil {
 		return nil, fmt.Errorf("%s: not a model list", url)
@@ -302,6 +304,18 @@ func fetchOne(ctx context.Context, url, key string, anthropic bool, headers map[
 	rows := v.Data
 	if len(rows) == 0 {
 		rows = v.Models
+	}
+	// A list that says it has more is a page of the vendor's catalog, not
+	// the catalog: a model the user picked that lives on a later page is
+	// not in this reply, and a base that answers without a model is read
+	// as one that dropped it (#904). The pick would go for good, on a list
+	// that never said the model was gone. A paged reply therefore says
+	// nothing about what this base serves today, and is no answer at all:
+	// the base is one that could not be asked, which keeps what it listed
+	// last time. The shape is a convention, not a vendor's — Anthropic's
+	// and OpenAI's /v1/models both page with has_more and last_id.
+	if v.HasMore {
+		return nil, fmt.Errorf("%s: only a page of the model list (has_more, last id %q), not the whole list", url, v.LastID)
 	}
 	var out []Model
 	for _, r := range rows {
