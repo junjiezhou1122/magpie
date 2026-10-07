@@ -18,9 +18,11 @@ import (
 	"github.com/yetone/magpie/internal/agentenv"
 )
 
-// The shapes below are openrouter.ai's own, as it answered on 2026-10-06
-// (evidence/live-openrouter-probe-r5.txt). The catalog is left as it came,
-// with the long descriptions cut, as nothing here reads them.
+// The shapes below are openrouter.ai's own, as it answered on 2026-10-06.
+// The catalog is left as it came, with the long descriptions cut, as
+// nothing here reads them; it is also the list of ids OpenRouter serves,
+// which is what says of the two pages under testdata that they name none
+// (openRouterNamespaced).
 
 // openRouterCatalog is /api/v1/models without the Anthropic header: the
 // whole catalog, 466 ids, the Anthropic models among them under their own
@@ -200,10 +202,10 @@ func TestFetchKeepsPicksWhenAModelListIsPaginated(t *testing.T) {
 // catalog again, twenty newest first, every id with `anthropic/` in front
 // of the vendor's own (`anthropic/mistralai/mistral-large-4-0`) or with a
 // `[1m]` suffix OpenRouter does not serve, and the cursors of the pages
-// after (2026-10-06, evidence/live-openrouter-probe.txt). Merged into the
+// after (observed 2026-10-06). Merged into the
 // union those twenty are twenty entries of the model picker that name no
-// model: none of them is in OpenRouter's own catalog, which is the list of
-// ids it serves (evidence/live-openrouter-routability.txt). That is what
+// model: none of them is in OpenRouter's own catalog above, which is the
+// list of ids it serves. That is what
 // #904's reporter saw as a long, cluttered list.
 //
 // The rule is OpenRouter's, and is scoped to it: the same fetch for another
@@ -355,7 +357,9 @@ func TestFetchOpenRouterAddsNoNamespacedModelAndKeepsPicks(t *testing.T) {
 // really does — carry on, 413 ids deeper into the namespace, and stop
 // there. So the fixture is checked against what it is for: the twenty and
 // the 413, the cursor between them, and neither page an id OpenRouter
-// serves (evidence/live-openrouter-probe-r5.txt).
+// serves. The counts are of the day they were taken (2026-10-06) and the
+// files under testdata are the replies of that day, so what is asserted is
+// the shape and not today's catalog.
 func TestOpenRouterNamespacedPagesAreTheEndpointShape(t *testing.T) {
 	one := readOpenRouterPage(t, openRouterFile(t, "testdata/openrouter-models-anthropic-1.json"))
 	two := readOpenRouterPage(t, openRouterFile(t, "testdata/openrouter-models-anthropic-2.json"))
@@ -546,12 +550,29 @@ func TestFetchOpenRouterRuleOverTheFourBaseCombinations(t *testing.T) {
 		// It is asked, since it is the only base there is. What it answers
 		// with is the namespaced list, which is not a list of models to
 		// serve: its pages are followed to the end of it (catalog.Paged) and
-		// the twenty and the 413 that come back are refused as a whole, so
-		// the fetch fails rather than saving them as the provider's models.
-		// Two requests: the page asked as the URL stands, and the one under
-		// the cursor it ended at.
-		if ms, err := p.Fetch(context.Background()); err == nil {
-			t.Errorf("the namespaced list was taken as the catalog: %d ids, first %q", len(ms), idsOf(ms)[0])
+		// every id that comes back is refused as a whole, so the fetch fails
+		// rather than saving them as the provider's models. Two requests: the
+		// page asked as the URL stands, and the one under the cursor it ended
+		// at.
+		ms, err := p.Fetch(context.Background())
+		if err == nil {
+			t.Fatalf("the namespaced list was taken as the catalog: %d ids, first %q", len(ms), idsOf(ms)[0])
+		}
+		// What the user is left with says why the answer is no good and what
+		// to do instead — a Chat base of OpenRouter's, or the ids typed in
+		// by hand, which is the advice the caller adds to every base it
+		// could not ask. It does not count the list it refused: how many ids
+		// are namespaced today is of OpenRouter's catalog, not a fact about
+		// the base, and the number in a message would be wrong tomorrow.
+		for _, want := range []string{"https://openrouter.ai/api/v1", "type its model ids in by hand"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the message does not tell the user what to do (%q missing): %v", want, err)
+			}
+		}
+		// left: the message with the one number it must keep, the version in
+		// the Chat base's path
+		if rest := strings.ReplaceAll(err.Error(), "https://openrouter.ai/api/v1", ""); strings.ContainsAny(rest, "0123456789") {
+			t.Errorf("the message counts something of the day's catalog: %v", err)
 		}
 		if n := asked(); n != 2 {
 			t.Errorf("asked OpenRouter's Anthropic base %d times, want the two pages it answers with", n)
