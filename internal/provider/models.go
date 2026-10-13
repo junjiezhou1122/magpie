@@ -537,17 +537,27 @@ func (p Provider) fetchOne(ctx context.Context) (fetched, error) {
 			}
 			// listed as the Gemini API lists them, the key in its header,
 			// and merged like any other protocol's list (#1346)
+			asked[protoBase] = true
 			ms, _, err := catalog.FetchGemini(ctx, protoBase, p.Key, p.listHeaders())
 			if err != nil {
 				if !slices.Contains(errs, err.Error()) {
 					errs = append(errs, err.Error())
 				}
+				// a base that could not be asked keeps the models it listed
+				// last time, as any other protocol's does (#904)
+				dead = append(dead, protoBase)
 				continue
 			}
 			if base == "" {
 				// the base it answered at, as it will be asked next time
 				base = protoBase
 			}
+			// what it listed is a side like any other protocol's, so that a
+			// fetch finding this base down keeps its own models instead of
+			// reading a picked Gemini model as gone (#904, yetone's review
+			// of #1006)
+			sides = append(sides, side{protoBase, ms})
+			answered[protoBase] = true
 			for _, m := range ms {
 				add(m)
 			}

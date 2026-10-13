@@ -634,6 +634,206 @@ func TestFetchDropsAGoneModelWhileAnotherProtocolFails(t *testing.T) {
 	}
 }
 
+// The same for a Gemini base, which the union merge had left out: a
+// protocol whose list is merged but which is kept in no side is a base a
+// fetch cannot find when it fails, so the picked Gemini model it listed was
+// read as gone and dropped for good — the very fault the Anthropic base
+// above was fixed for (yetone's review of #1006, 2026-10-13).
+func TestFetchKeepsTheModelsAFailedGeminiBaseListed(t *testing.T) {
+	isolate(t)
+	h := t.TempDir()
+	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
+	t.Setenv("PATH", h)
+	for _, v := range agentenv.Vars {
+		t.Setenv(v, "")
+	}
+
+	chat := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte(`{"data":[{"id":"gpt-a"}]}`))
+	}))
+	defer chat.Close()
+	var list atomic.Value
+	list.Store(`{"models":[{"name":"models/claude-b","supportedGenerationMethods":["generateContent"]}]}`)
+	var down atomic.Bool
+	gemini := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if down.Load() {
+			http.Error(w, "upstream is down", http.StatusBadGateway)
+			return
+		}
+		if r.URL.Path != "/v1beta/models" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte(list.Load().(string)))
+	}))
+	defer gemini.Close()
+
+	if err := Save(Provider{
+		ID:     "gemfailing",
+		Name:   "GemFailing",
+		Chat:   chat.URL + "/v1",
+		Gemini: gemini.URL + "/v1beta",
+		Key:    "sk-g",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fetch := func() error {
+		p, err := Find("gemfailing")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = p.Fetch(context.Background())
+		return err
+	}
+	if err := fetch(); err != nil {
+		t.Fatal(err)
+	}
+	// both models picked from the list both bases answered with
+	p, _ := Find("gemfailing")
+	p.Models = []string{"gpt-a", "claude-b"}
+	if err := Save(*p); err != nil {
+		t.Fatal(err)
+	}
+
+	// the Gemini base is down: the fetch still succeeds on the Chat one,
+	// and nothing the failed endpoint listed goes missing
+	down.Store(true)
+	if err := fetch(); err != nil {
+		t.Fatalf("fetch with the Gemini base down: %v", err)
+	}
+	p, _ = Find("gemfailing")
+	if want := []string{"gpt-a", "claude-b"}; !slices.Equal(p.Models, want) {
+		t.Fatalf("picks after the Gemini base failed: %v, want %v", p.Models, want)
+	}
+	live, _, ok := p.live()
+	if !ok {
+		t.Fatal("no list kept after the Gemini base failed")
+	}
+	if ids := idsOf(live); !slices.Equal(ids, []string{"gpt-a", "claude-b"}) {
+		t.Fatalf("list after the Gemini base failed: %v, want gpt-a and claude-b", ids)
+	}
+	if !p.serves("claude-b") {
+		t.Error("claude-b is not a model of the provider any more")
+	}
+
+	// and once the Gemini base answers again its real list stands: a model
+	// it has dropped since is dropped here, so keeping is not keeping
+	// forever
+	down.Store(false)
+	list.Store(`{"models":[{"name":"models/claude-c","supportedGenerationMethods":["generateContent"]}]}`)
+	if err := fetch(); err != nil {
+		t.Fatal(err)
+	}
+	p, _ = Find("gemfailing")
+	if want := []string{"gpt-a"}; !slices.Equal(p.Models, want) {
+		t.Fatalf("picks after the Gemini base answered again: %v, want %v", p.Models, want)
+	}
+	live, _, ok = p.live()
+	if !ok {
+		t.Fatal("no list kept after the Gemini base answered again")
+	}
+	if ids := idsOf(live); !slices.Equal(ids, []string{"gpt-a", "claude-c"}) {
+		t.Fatalf("list after the Gemini base answered again: %v, want gpt-a and claude-c", ids)
+	}
+}
+
+// And the same the other way round for Gemini: a model the Gemini base has
+// really dropped is dropped from the picks while the Chat base is down. It
+// is what stops the fix above from keeping every old model by never
+// dropping anything (yetone's review).
+func TestFetchDropsAGoneGeminiModelWhileAnotherProtocolFails(t *testing.T) {
+	isolate(t)
+	h := t.TempDir()
+	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
+	t.Setenv("PATH", h)
+	for _, v := range agentenv.Vars {
+		t.Setenv(v, "")
+	}
+
+	var list atomic.Value
+	list.Store(`{"data":[{"id":"gpt-a"},{"id":"gpt-b"}]}`)
+	var down atomic.Bool
+	chat := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if down.Load() {
+			http.Error(w, "upstream is down", http.StatusBadGateway)
+			return
+		}
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte(list.Load().(string)))
+	}))
+	defer chat.Close()
+	var gemList atomic.Value
+	gemList.Store(`{"models":[{"name":"models/claude-b","supportedGenerationMethods":["generateContent"]},` +
+		`{"name":"models/claude-c","supportedGenerationMethods":["generateContent"]}]}`)
+	gemini := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1beta/models" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte(gemList.Load().(string)))
+	}))
+	defer gemini.Close()
+
+	if err := Save(Provider{
+		ID:     "gemhalf",
+		Name:   "GemHalf",
+		Chat:   chat.URL + "/v1",
+		Gemini: gemini.URL + "/v1beta",
+		Key:    "sk-h",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fetch := func() error {
+		p, err := Find("gemhalf")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = p.Fetch(context.Background())
+		return err
+	}
+	if err := fetch(); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := Find("gemhalf")
+	p.Models = []string{"gpt-a", "gpt-b", "claude-b", "claude-c"}
+	if err := Save(*p); err != nil {
+		t.Fatal(err)
+	}
+
+	// the Gemini base has dropped claude-c, and the Chat base is down
+	gemList.Store(`{"models":[{"name":"models/claude-b","supportedGenerationMethods":["generateContent"]}]}`)
+	down.Store(true)
+	if err := fetch(); err != nil {
+		t.Fatalf("fetch with the Chat base down: %v", err)
+	}
+	p, _ = Find("gemhalf")
+	if want := []string{"gpt-a", "gpt-b", "claude-b"}; !slices.Equal(p.Models, want) {
+		t.Fatalf("picks after the Gemini list dropped a model: %v, want %v", p.Models, want)
+	}
+	live, _, ok := p.live()
+	if !ok {
+		t.Fatal("no list kept after a protocol failed")
+	}
+	// the bases are asked in order, and what a failed base keeps is added
+	// beside the list, not in the place it would have answered at
+	if ids := idsOf(live); !slices.Equal(ids, []string{"claude-b", "gpt-a", "gpt-b"}) {
+		t.Fatalf("list after the Gemini list dropped a model: %v, want claude-b, gpt-a and gpt-b", ids)
+	}
+}
+
 // idsOf are the ids of a list, in its order.
 func idsOf(ms []catalog.Model) []string {
 	var out []string
