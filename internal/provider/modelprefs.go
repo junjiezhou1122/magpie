@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"maps"
@@ -358,7 +359,7 @@ func setModelImage(ref string, images *bool) (bool, error) {
 }
 
 // SetModelAPI says which one of a provider's APIs a model is asked on —
-// chat, responses or anthropic — for a relay whose one key serves some of
+// chat, responses, anthropic or gemini — for a relay whose one key serves some of
 // its models on one and others on another (01huadalang on Discord: 有的供应商
 // 一个 api 里有很多模型但是不同协议); "" leaves it to the vendor's list and
 // the URLs the provider has, as before. It must be an API the provider has
@@ -377,8 +378,8 @@ func setModelAPI(ref, api string) (bool, error) {
 	}
 	proto := Protocol(strings.TrimSpace(api))
 	if proto != "" {
-		if !slices.Contains(Protocols, proto) {
-			return false, fmt.Errorf("a model's API is chat, responses or anthropic, not %q", api)
+		if !modelAPI(proto) {
+			return false, fmt.Errorf("a model's API is chat, responses, anthropic or gemini, not %q", api)
 		}
 		if p.Base(proto) == "" {
 			return false, fmt.Errorf("%s has no %s URL to ask %s on: add it under More endpoints first", p.ID, proto, model)
@@ -413,10 +414,18 @@ func (p Provider) ModelAPI(model string) (Protocol, bool) {
 		return "", false
 	}
 	proto := Protocol(heldSettings().ModelAPIs[p.ID+"/"+model])
-	if proto == "" || !slices.Contains(Protocols, proto) || p.Base(proto) == "" {
+	if proto == "" || !modelAPI(proto) || p.Base(proto) == "" {
 		return "", false
 	}
 	return proto, true
+}
+
+// modelAPI is whether proto is one a model can be set to be asked on: the
+// three magpie translates between, and a Gemini URL's generateContent
+// (Kayphoon on Discord: a custom provider's Gemini format, which a model's
+// own choice didn't offer)
+func modelAPI(proto Protocol) bool {
+	return slices.Contains(Protocols, proto) || proto == Gemini
 }
 
 // ModelPref is what the provider editor's Names & levels changed of one
@@ -543,7 +552,13 @@ func setModelSame(ref, same string) (bool, error) {
 
 // ImageOverride is the user's answer for whether pid's model takes images.
 func ImageOverride(pid, model string) (bool, bool) {
-	v, ok := settings.Load().ModelImages[pid+"/"+model]
+	return ImageOverrideIn(settings.Load(), pid, model)
+}
+
+// ImageOverrideIn is ImageOverride from settings s already read: a list of
+// many models reads them once, not for each (lml on Discord, Windows).
+func ImageOverrideIn(s settings.Settings, pid, model string) (bool, bool) {
+	v, ok := s.ModelImages[pid+"/"+model]
 	return v, ok
 }
 
@@ -583,9 +598,10 @@ func renameModelPrefs(s *settings.Settings, from, to string) bool {
 	// the models a user has hidden from a picker are keyed by provider as
 	// well, and are not one of the per-model preference maps: they say
 	// which models are shown, not what a model is called or costs
-	// (and so is the order they are listed in, and the ones sent fast)
+	// (and so is the order they are listed in, the ones picked for an agent
+	// shown only its picks, and the ones sent fast)
 	hidden := false
-	for _, m := range []map[string][]string{s.HiddenModels, s.OrderedModels, s.FastPicks} {
+	for _, m := range []map[string][]string{s.HiddenModels, s.PickedModels, s.OrderedModels, s.FastPicks} {
 		for _, ids := range m {
 			for i, id := range ids {
 				if rest, ok := strings.CutPrefix(id, from+"/"); ok {
@@ -629,18 +645,24 @@ func Labels(es []Entry) []string {
 	same := map[string]int{}
 	if plain || own {
 		for _, e := range es {
-			same[strings.ToLower(e.Name)]++
+			same[strings.ToLower(e.PlainName())]++
 		}
 	}
 	for i, e := range es {
 		out[i] = e.Label()
 		mine := own && (e.Default != "" || e.Named)
-		if (plain || mine) && e.Name != "" && same[strings.ToLower(e.Name)] == 1 {
-			out[i] = e.Name
+		if name := e.PlainName(); (plain || mine) && name != "" && same[strings.ToLower(name)] == 1 {
+			out[i] = name
 		}
 	}
 	return out
 }
+
+// PlainName is the entry's name alone: a remote magpie's model's without
+// the provider its list put after it by that magpie's own setting, which
+// this one's Provider in model names Off leaves out as well (ARNO on
+// Discord: "· Relay A" and "· routing group" stayed under Off).
+func (e Entry) PlainName() string { return cmp.Or(e.Plain, e.Name) }
 
 // The ways the agents' lists name models (SuffixMode): every name with its
 // provider's after it, as by default; all but the names the user gave

@@ -3,6 +3,7 @@ package provider
 import (
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/yetone/magpie/internal/catalog"
@@ -81,5 +82,43 @@ func TestOpenCodeZenNeedsNoKey(t *testing.T) {
 	// another provider still needs one
 	if _, err := Add(Provider{Name: "Relay", Chat: "https://api.relay.example/v1", Models: []string{"m"}}); err == nil {
 		t.Fatal("a relay with no key")
+	}
+}
+
+// #1795: Add another key on an OpenCode Zen provider with a key of the
+// user's own, with nothing pasted, adds public behind it, as a new Zen
+// provider saved with no key has it; asked again, it says it has it. Kilo,
+// whose free models need no key too, has no such key to add.
+func TestZenAddKeyEmptyIsPublic(t *testing.T) {
+	isolate(t)
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	zen, err := FromPreset("opencode-zen")
+	if err != nil {
+		t.Fatal(err)
+	}
+	zen.ID, zen.Key = "zen", "sk-own"
+	if err := Save(zen); err != nil {
+		t.Fatal(err)
+	}
+	if err := AddKey("zen", "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := Find("zen")
+	if on := p.KeysOn(); len(on) != 2 || on[0].Key != "sk-own" || on[1].Key != OpenCodeAnonymousKey {
+		t.Fatalf("keys on %+v", on)
+	}
+	if err := AddKey("zen", "", "", ""); err == nil || !strings.Contains(err.Error(), "already has public") {
+		t.Fatalf("public twice: %v", err)
+	}
+	kilo, err := FromPreset("kilo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kilo.ID, kilo.Key = "kilo", "sk-kilo"
+	if err := Save(kilo); err != nil {
+		t.Fatal(err)
+	}
+	if err := AddKey("kilo", "", "", ""); err == nil {
+		t.Fatal("Kilo took an empty key")
 	}
 }

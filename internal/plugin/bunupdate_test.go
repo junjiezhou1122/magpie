@@ -11,13 +11,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // bunReleases serves Bun's releases as GitHub does: each version's zip for
@@ -95,6 +96,8 @@ func TestBunDefaultSums(t *testing.T) {
 		"bun-darwin-x64",
 		"bun-linux-aarch64",
 		"bun-linux-x64-baseline",
+		"bun-linux-aarch64-musl",
+		"bun-linux-x64-musl-baseline",
 		"bun-windows-x64-baseline",
 		"bun-linux-aarch64-android",
 		"bun-linux-x64-android-baseline",
@@ -109,6 +112,15 @@ func TestBunDefaultSums(t *testing.T) {
 	}
 	if got := bunChecksum("9.9.9", "bun-linux-x64-baseline"); got != "" {
 		t.Fatalf("a newer Bun used the built-in checksum: %q", got)
+	}
+}
+
+// The tests' oldest Bun (testenv.Bun skips an older one on PATH) is the
+// oldest magpie runs plugins on. testenv can't import this package, whose
+// own tests use it, so it keeps a copy (#1600).
+func TestMinBunIsBunVersion(t *testing.T) {
+	if testenv.MinBun != BunVersion {
+		t.Fatalf("testenv.MinBun is %s, BunVersion %s: change both", testenv.MinBun, BunVersion)
 	}
 }
 
@@ -209,10 +221,7 @@ func TestCheckBunSetsAsideOneThatFailsItsTry(t *testing.T) {
 
 // The real try: the Bun on PATH passes it, as its own version.
 func TestTryBunOnRealBun(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	v := bunReported(bun)
 	if err := tryBun(context.Background(), bun, v); err != nil {
 		t.Fatalf("bun %s: %v", v, err)
@@ -228,10 +237,7 @@ func TestHostFallsBackWhenTheNewBunDies(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the dying bun is a shell script")
 	}
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	bunHome(t, "9.9.9", time.Now().Add(-72*time.Hour))
 	t.Cleanup(Settle)
 	if err := os.MkdirAll(bunDirOf(BunVersion), 0o755); err != nil {
@@ -243,9 +249,7 @@ func TestHostFallsBackWhenTheNewBunDies(t *testing.T) {
 	if err := os.MkdirAll(bunDirOf("9.9.9"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(bunExeOf("9.9.9"), []byte("#!/bin/sh\nexit 3\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testenv.Program(t, bunExeOf("9.9.9"), "#!/bin/sh\nexit 3\n")
 	if err := writeBunState(bunState{Current: "9.9.9", Previous: BunVersion}); err != nil {
 		t.Fatal(err)
 	}

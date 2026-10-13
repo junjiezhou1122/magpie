@@ -21,7 +21,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/yetone/magpie/internal/agentenv"
 )
@@ -40,6 +42,23 @@ const (
 
 // folderVars are the variables Isolate points into the temporary home.
 var folderVars = []string{"HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "APPDATA", "LOCALAPPDATA"}
+
+// proxyVars are the machine's proxy variables. net/http reads them once per
+// process, at its first routed request, so a test binary that lets them
+// stand freezes the machine's proxy into that read: a test that sets its
+// own afterwards reads the machine's instead (search's Auto, which follows
+// ALL_PROXY alone for that reason), and Offline's refused hosts are carried
+// for real by the machine's proxy standing on loopback.
+var proxyVars = []string{"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"}
+
+// ClearProxy unsets the machine's proxy variables. Isolate calls it before
+// the tests run; a package that isolates itself in its own TestMain calls
+// it too, before the first request any test makes.
+func ClearProxy() {
+	for _, k := range proxyVars {
+		os.Unsetenv(k)
+	}
+}
 
 // Main runs the package's tests in a home of their own and exits with
 // their code.
@@ -66,6 +85,7 @@ func RunIn(m *testing.M, setup func(home string)) int {
 		if setup != nil {
 			setup(home)
 		}
+		defer RemovePrograms()
 		return m.Run()
 	}
 	home, err := Isolate()
@@ -74,6 +94,7 @@ func RunIn(m *testing.M, setup func(home string)) int {
 		return 1
 	}
 	defer remove(home)
+	defer RemovePrograms()
 	if setup != nil {
 		setup(home)
 	}
@@ -108,6 +129,7 @@ func Isolate() (string, error) {
 			return "", err
 		}
 	}
+	ClearProxy()
 	if err := inertTools(home); err != nil {
 		return "", err
 	}
@@ -174,10 +196,10 @@ func inertTools(home string) error {
 	if err := os.Mkdir(bin, 0o755); err != nil {
 		return err
 	}
+	if err := StandIns(bin, tools); err != nil {
+		return err
+	}
 	for _, name := range tools {
-		if err := os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
-			return err
-		}
 		// Windows finds a program by PATHEXT; a .bat comes before the
 		// user's claude.cmd further down PATH
 		if runtime.GOOS == "windows" {
@@ -188,6 +210,43 @@ func inertTools(home string) error {
 	}
 	return os.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
+
+// StandIns writes a failing program for each name in bin. On macOS each
+// is run once now, in the background, so that the check macOS makes of a
+// new program's first run (Program) is made while the tests start rather
+// than in the first test to reach it, and without holding them up.
+func StandIns(bin string, names []string) error {
+	for _, name := range names {
+		p := filepath.Join(bin, name)
+		if err := os.WriteFile(p, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+			return err
+		}
+		if runtime.GOOS == "darwin" {
+			warming.Add(1)
+			go func() {
+				defer warming.Done()
+				if proc, err := os.StartProcess(p, []string{p}, &os.ProcAttr{}); err == nil {
+					proc.Wait()
+					record(p)
+				}
+			}()
+		}
+	}
+	return nil
+}
+
+// Zone sets time.Local for the test, and puts it back after. It first
+// waits out the stand-ins' first runs: they os.Stat what ran, which reads
+// time.Local, so a test that swaps it while they are under way races them.
+func Zone(t testing.TB, loc *time.Location) {
+	warming.Wait()
+	old := time.Local
+	time.Local = loc
+	t.Cleanup(func() { time.Local = old })
+}
+
+// warming is the stand-ins' first runs under way.
+var warming sync.WaitGroup
 
 // within says whether path lies in dir.
 func within(path, dir string) bool {

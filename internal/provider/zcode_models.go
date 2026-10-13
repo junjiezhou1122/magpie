@@ -33,6 +33,7 @@ import (
 	"strings"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/proc"
 )
 
 type zcodeBuiltin struct {
@@ -230,7 +231,7 @@ var zcodeBuiltinFiles = func() []string {
 	home, _ := os.UserHomeDir()
 	fs, _ := filepath.Glob(filepath.Join(home, ".zcode", "v2", "runtime", "provider", "*", "*", "*", "zcode-builtin.json"))
 	if runtime.GOOS == "darwin" {
-		fs = append(fs, "/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json")
+		fs = append(fs, proc.SystemDirs("/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json")...)
 	}
 	return fs
 }

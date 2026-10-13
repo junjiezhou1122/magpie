@@ -59,7 +59,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.route("**/*", server(lang));
         await page.goto("http://magpie.test/?view=plugins");
         const view = page.locator("#view-plugins");
-        await view.locator(".lib-tabs .opt", { hasText: w.installed }).click();
+        await view.page().locator(":is(.lib-tabs .opt, .nav-s):visible", { hasText: w.installed }).click();
         const row = (name) => view.locator(".pm-row").filter({ has: page.locator(".name", { hasText: name }) });
 
         const alias = row("alias.middleware.js");
@@ -159,7 +159,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         });
         await page.goto("http://magpie.test/?view=plugins");
         const view = page.locator("#view-plugins");
-        await view.locator(".lib-tabs .opt", { hasText: w.installed }).click();
+        await view.page().locator(":is(.lib-tabs .opt, .nav-s):visible", { hasText: w.installed }).click();
         const row = (name) => view.locator(".pm-row").filter({ has: page.locator(".name", { hasText: name }) });
         const alias = row("alias.middleware.js");
         await alias.waitFor();
@@ -239,6 +239,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const card = (n) => page.locator("#view-plugins .pm-card").filter({ hasText: n });
         assert.equal((await card("Zed").locator(".pm-chip.kind").innerText()).trim(), w.pv);
         assert.equal((await card("Model map").locator(".pm-chip.kind").innerText()).trim(), w.mwc);
+        // each kind its own hue (yetone: 中间件和供应商稍微有点区分吧)
+        const hue = (n) => card(n).locator(".pm-chip.kind").evaluate((e) => getComputedStyle(e).color);
+        assert.notEqual(await hue("Zed"), await hue("Model map"));
         assert.equal(await secs.nth(1).locator(".pm-card").count(), 1);
         if (process.env.ARTIFACT_DIR) await page.locator("#view-plugins").screenshot({ path: path.join(process.env.ARTIFACT_DIR, `plugin-kinds-${engine}-${lang}.png`) });
         assert.deepEqual(errors, []);

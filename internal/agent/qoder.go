@@ -29,6 +29,7 @@ package agent
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"slices"
 
@@ -115,6 +116,12 @@ func qoderAt(at place, b qoderBuild) *Agent {
 	return &Agent{
 		ID: b.id, Name: b.name, Icon: "qoder", Aliases: b.aliases, Spelled: prefixed,
 		Bin: b.bin, Dir: dir, Path: path,
+		// Qoder's JetBrains plugin keeps its indexer, app/ and plugins/ in
+		// the same folder, and writes a settings.json of enabledPlugins
+		// alone, with no CLI installed (#1495): neither is a sign of the
+		// CLI. Its command, or a settings.json with any other key, is.
+		dirShared: true,
+		pathOwn:   func() bool { return !qoderPluginOnly(path) },
 		Sync: func() error {
 			ref, ok := cutMagpie(get("model.name"))
 			if !ok {
@@ -124,7 +131,7 @@ func qoderAt(at place, b qoderBuild) *Agent {
 		},
 		Notice: func() string {
 			if Running(b.procs...) {
-				return b.name + " reads its settings as a session starts — open sessions keep the model they have; new ones use this."
+				return noticeQoder.say("agent", b.name)
 			}
 			return ""
 		},
@@ -298,4 +305,28 @@ func qoderProviderAt(agent, model, v1 string) map[string]any {
 // the new one.
 func qoderKeyed(key, agent string) bool {
 	return key == gateway.TokenFor(agent) || ourKey(key)
+}
+
+// what Qoder's builds say after a change (notice.go)
+var noticeQoder = newNotice("{agent} reads its settings as a session starts — open sessions keep the model they have; new ones use this.")
+
+// qoderPluginOnly reports whether the settings file at path is the one
+// Qoder's JetBrains plugin writes, an object holding enabledPlugins and
+// nothing else. A file that can't be read or parsed isn't known to be
+// that, so it says false and the file still counts as the CLI's.
+func qoderPluginOnly(path string) bool {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var m map[string]json.RawMessage
+	if json.Unmarshal(b, &m) != nil || len(m) == 0 {
+		return false
+	}
+	for k := range m {
+		if k != "enabledPlugins" {
+			return false
+		}
+	}
+	return true
 }

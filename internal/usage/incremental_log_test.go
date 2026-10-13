@@ -10,6 +10,8 @@ import (
 	"github.com/yetone/magpie/internal/testenv"
 )
 
+// historyLog writes n calls of 90 days ago, a second apart, and one at
+// Clock's time.
 func historyLog(t testing.TB, n int) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(Path()), 0700); err != nil {
@@ -20,11 +22,12 @@ func historyLog(t testing.TB, n int) {
 		t.Fatal(err)
 	}
 	enc := json.NewEncoder(f)
-	old := time.Now().AddDate(0, 0, -90)
+	now := Clock()
+	old := now.AddDate(0, 0, -90)
 	for i := 0; i < n; i++ {
 		r := Record{Time: old.Add(time.Duration(i) * time.Second), Agent: "codex", Provider: "relay", Model: "m", Session: "s", Input: 10, Status: 200}
 		if i == n-1 {
-			r.Time = time.Now()
+			r.Time = now
 		}
 		if err := enc.Encode(r); err != nil {
 			f.Close()
@@ -36,19 +39,40 @@ func historyLog(t testing.TB, n int) {
 	}
 }
 
+// Cache performance tests start after the filesystem's change stamp has settled.
+func settleLogClock(t testing.TB) {
+	t.Helper()
+	old := logIndexNow
+	logIndexNow = func() time.Time { return time.Now().Add(2 * logStampSettle) }
+	t.Cleanup(func() { logIndexNow = old })
+}
+
 func TestUsageOverviewDoesNotReparseHistory(t *testing.T) {
-	pageHome(t)
-	historyLog(t, 4000)
-	if s := Summarize(Today); s.Calls != 1 {
-		t.Fatal(s.Calls)
+	var allocations [2]float64
+	for i, n := range []int{10, 4000} {
+		pageHome(t)
+		holdClock(t, time.Date(2026, 9, 30, 12, 0, 0, 0, time.Local))
+		historyLog(t, n)
+		if s := Summarize(Today); s.Calls != 1 {
+			t.Fatal(s.Calls)
+		}
+		allocations[i] = testing.AllocsPerRun(2, func() {
+			Append(Record{Agent: "codex", Provider: "relay", Model: "m", Input: 1, Status: 200})
+			Summarize(Today)
+			time.Sleep(logStampSettle + 20*time.Millisecond)
+			Summarize(Today)
+		})
 	}
-	if n := testing.AllocsPerRun(2, func() { Summarize(Today) }); n > 1500 {
-		t.Fatalf("unchanged Today reparsed history: %.0f allocations", n)
+	// Measure what history adds, excluding the append and two queries' fixed cost.
+	t.Logf("append + unsettled + settled summary: %.0f allocations over 4000 rows, %.0f over 10", allocations[1], allocations[0])
+	if grown := allocations[1] - allocations[0]; grown > 1500 {
+		t.Fatalf("append then settle reparsed history: %.0f extra allocations", grown)
 	}
 }
 
 func TestUsageViasSkipsOldHistory(t *testing.T) {
 	pageHome(t)
+	settleLogClock(t)
 	historyLog(t, 4000)
 	since := time.Now().Add(-time.Hour)
 	if v := Vias(since); len(v) != 1 || v["codex|s"][0].Calls != 1 {
@@ -61,6 +85,7 @@ func TestUsageViasSkipsOldHistory(t *testing.T) {
 
 func TestUsageOverviewRefreshesAfterAppendAndReplacement(t *testing.T) {
 	pageHome(t)
+	now := holdClock(t, time.Date(2026, 9, 30, 12, 0, 0, 0, time.Local))
 	Append(Record{Agent: "codex", Provider: "relay", Model: "m", Input: 2, Status: 200})
 	if s := Summarize(Today); s.Input != 2 {
 		t.Fatal(s)
@@ -70,7 +95,7 @@ func TestUsageOverviewRefreshesAfterAppendAndReplacement(t *testing.T) {
 		t.Fatal(s)
 	}
 	f := filepath.Join(filepath.Dir(Path()), "replacement.jsonl")
-	b, _ := json.Marshal(Record{Time: time.Now(), Agent: "codex", Provider: "relay", Input: 7, Status: 200})
+	b, _ := json.Marshal(Record{Time: now, Agent: "codex", Provider: "relay", Input: 7, Status: 200})
 	if err := os.WriteFile(f, append(b, '\n'), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -110,11 +135,37 @@ func TestLogAppendReusesSealedBlocks(t *testing.T) {
 	}
 }
 
+func TestLogAppendThenSettleReusesHistory(t *testing.T) {
+	pageHome(t)
+	historyLog(t, 4000)
+	before := readLogSnapshot()
+	Append(Record{Agent: "codex", Provider: "relay", Model: "m", Input: 1, Status: 200})
+	appended := readLogSnapshot()
+	if logChangeStamp(appended.info) == "" {
+		t.Skip("filesystem does not expose change time")
+	}
+	if appended.settled || appended.hash == "" {
+		t.Fatal("append must leave a recent snapshot with a fingerprint")
+	}
+	if appended.blocks[0] != before.blocks[0] {
+		t.Fatal("append rebuilt the sealed history")
+	}
+	time.Sleep(logStampSettle + 20*time.Millisecond)
+	settled := readLogSnapshot()
+	if !settled.settled || settled.version != appended.version || settled.blocks[0] != appended.blocks[0] {
+		t.Fatalf("unchanged settled read rebuilt history: version %d -> %d", appended.version, settled.version)
+	}
+	if appended.settled {
+		t.Fatal("promotion mutated the published snapshot")
+	}
+}
+
 func TestLogPartialLineAndTruncation(t *testing.T) {
 	pageHome(t)
+	now := holdClock(t, time.Date(2026, 9, 30, 12, 0, 0, 0, time.Local))
 	Append(Record{Agent: "codex", Input: 2, Status: 200})
 	Summarize(Today)
-	b, _ := json.Marshal(Record{Time: time.Now(), Agent: "codex", Input: 7, Status: 200})
+	b, _ := json.Marshal(Record{Time: now, Agent: "codex", Input: 7, Status: 200})
 	f, e := os.OpenFile(Path(), os.O_APPEND|os.O_WRONLY, 0600)
 	if e != nil {
 		t.Fatal(e)
@@ -143,6 +194,7 @@ func TestLogPartialLineAndTruncation(t *testing.T) {
 
 func TestCachedSummaryRemainsCallerOwned(t *testing.T) {
 	pageHome(t)
+	holdClock(t, time.Date(2026, 9, 30, 12, 0, 0, 0, time.Local))
 	Append(Record{Agent: "codex", Input: 3, Status: 200})
 	s := Summarize(Today)
 	s.Series[0].Calls = 999
@@ -154,6 +206,7 @@ func TestCachedSummaryRemainsCallerOwned(t *testing.T) {
 }
 
 func BenchmarkIncrementalUsage(b *testing.B) {
+	settleLogClock(b)
 	// benchmark homes are isolated just as pageHome isolates test homes
 	testenv.SetHome(b, b.TempDir())
 	b.Setenv("XDG_CONFIG_HOME", b.TempDir())
@@ -184,6 +237,7 @@ func BenchmarkIncrementalUsage(b *testing.B) {
 
 func TestAppendDoesNotWaitForIndexBuild(t *testing.T) {
 	pageHome(t)
+	holdClock(t, time.Date(2026, 9, 30, 12, 0, 0, 0, time.Local))
 	logIndex.Lock()
 	done := make(chan struct{})
 	go func() { Append(Record{Agent: "codex", Input: 1, Status: 200}); close(done) }()

@@ -95,6 +95,14 @@ var usedCache struct {
 	// Codex reset spent), by agent/user: a reading begun before says
 	// nothing of them
 	renewed map[string]time.Time
+	// seen: each account's windows as last read, and when, by
+	// agent/user, kept through a reading that failed, for the next to be
+	// told renewed by (renewedFrom)
+	seen map[string]reading
+	// stale: made stale (StaleAllowance) while a reading was out, by
+	// agent; that reading was asked before an account said it was out,
+	// so what it tells is kept only until the next ask reads again
+	stale map[string]bool
 }
 
 // firstWait is how long a request waits for an agent's allowances the
@@ -116,12 +124,16 @@ type Limit struct {
 	Amount, Of float64
 	Unit       string
 	matches    func(string) bool
-	partial    bool // of a reading that may leave windows out (QuotaWindow.partial)
+	partial    bool   // of a reading that may leave windows out (QuotaWindow.partial)
+	Name       string // QuotaWindow.Name: which window it is, one reading to the next (WindowCapID)
 	// ResetRunsOut is when the reset the account spends by itself before
 	// it runs out does (resetRunsOut): spent then, it starts this window
 	// again — at Restarts, which routing takes for the window's renewal
 	// when it is the sooner. Zero when none will be spent so.
 	ResetRunsOut time.Time
+	// RunsOut is when the soonest of what the window has left is lost,
+	// apart from its reset (QuotaWindow.RunsOutAt): zero when not known.
+	RunsOut time.Time
 }
 
 // Restarts is when an auto-used reset starts the account's windows again,
@@ -201,6 +213,29 @@ func (a Allowance) For(model string, now time.Time) (used float64, renews []time
 	return used, renews
 }
 
+// Fullest is when the window For's share is of renews: the fullest that
+// counts model, the later of those as full. A display pairs the two, so
+// it names one window: a Factory account 32% into its week and 16% into
+// its month is 32% used, renewing with the week, not the month (#1778).
+// Zero when that window's reset isn't known, or has passed (it is empty
+// again then, its next reset not known).
+func (a Allowance) Fullest(model string, now time.Time) time.Time {
+	model = strings.ToLower(model)
+	used, at := -1.0, time.Time{}
+	for _, l := range a {
+		if !l.applies(model) {
+			continue
+		}
+		if !l.Resets.IsZero() && !l.Resets.After(now) {
+			l.Used, l.Resets = 0, time.Time{}
+		}
+		if l.Used > used || l.Used == used && l.Resets.After(at) {
+			used, at = l.Used, l.Resets
+		}
+	}
+	return at
+}
+
 // Count is the count of the window For's share is of — the fullest that
 // counts model — when the vendor counts it (WorkBuddy's credits): how much
 // of of is used, in unit; of is zero when it isn't counted so. A window
@@ -225,7 +260,11 @@ func (a Allowance) Count(model string, now time.Time) (amount, of float64, unit 
 // Renewal is For's renews as routing ranks them: a window not started,
 // or whose reset has passed, that says how long it runs is taken to
 // renew that long from now — a five hours not started renews within five
-// hours, the soonest of an account that has nothing longer (#576).
+// hours, the soonest of an account that has nothing longer (#576). One
+// whose credits left run out before it renews (Limit.RunsOut) renews
+// then, as what is left is lost then all the same: WorkBuddy's accounts,
+// whose credits have no reset, go by the package that ends first
+// (cdredfox on X).
 func (a Allowance) Renewal(model string, now time.Time) []time.Time {
 	model = strings.ToLower(model)
 	restart := a.Restarts(now)
@@ -239,6 +278,9 @@ func (a Allowance) Renewal(model string, now time.Time) []time.Time {
 			if l.Span > 0 {
 				l.Resets = now.Add(l.Span)
 			}
+		}
+		if l.RunsOut.After(now) && (l.Resets.IsZero() || l.RunsOut.Before(l.Resets)) {
+			l.Resets = l.RunsOut
 		}
 		l.Resets = restarted(l.Resets, restart)
 		ls = append(ls, l)
@@ -404,27 +446,55 @@ func Allowances(agent string) map[string]Allowance {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
+			share := renewalShare(agent) // read before the lock: it reads providers.json
 			began := time.Now()
 			all := map[string]Allowance{}
-			for user, q := range LoginUsage(ctx, agent) {
+			readings, readAt := loginUsageAt(ctx, agent)
+			for user, q := range readings {
 				if q.Error != "" || len(q.Windows) == 0 {
 					continue
 				}
 				all[user] = allowanceOf(q.Windows, time.Now()).restartedBy(resetRunsOut(agent, user, q.Windows, q.Resets))
 			}
 			c.Lock()
-			at := time.Now()
-			for user := range all {
-				if c.renewed[agent+"/"+strings.ToLower(user)].After(began) {
+			now := time.Now()
+			// as old as its oldest reading: one the Usage page made 50s
+			// ago, taken here, is read again in 10s, not kept a minute
+			// more — near its cap an account was sent on a reading two
+			// minutes old (#1295)
+			at := readAt
+			if c.seen == nil {
+				c.seen = map[string]reading{}
+			}
+			var renewed []string
+			for user, a := range all {
+				key := agent + "/" + strings.ToLower(user)
+				if c.renewed[key].After(began) {
 					// started again while this was read: not known till
 					// it is read again, at once
 					delete(all, user)
 					at = time.Time{}
+					continue
 				}
+				if was, ok := c.seen[key]; ok && a.renewedFrom(was.a, was.at, share, now) {
+					renewed = append(renewed, user)
+				}
+				c.seen[key] = reading{a, now}
+			}
+			if c.stale[agent] {
+				// kept, as weigh counts an account not known unused, but
+				// read again at the next ask
+				delete(c.stale, agent)
+				at = time.Time{}
 			}
 			c.m[agent], c.at[agent] = all, at
 			delete(c.loading, agent)
 			c.Unlock()
+			// told once the lock is let go (a hook may ask for these
+			// again), and before those waiting for them are let go
+			for _, user := range renewed {
+				tellRenewed(agent, user)
+			}
 			close(done)
 		}()
 	}
@@ -447,7 +517,12 @@ func Allowances(agent string) map[string]Allowance {
 }
 
 // OnRenewed has f told when an account's usage windows were started again
-// (a Codex reset spent), so what sat out waiting for them can come back.
+// (a Codex reset spent), or a reading of them (Allowances) finds one it
+// was full in full no more, so what sat out waiting for them can come
+// back; agent is the one its usage is read under (Account.UsageAgent).
+// And, as agent "" and the key's KeyAllowanceID, when a reading of a key's
+// own windows finds one it was full in full no more: its limit raised in
+// its panel, or its usage reset.
 func OnRenewed(f func(agent, user string)) {
 	renewedHooks.Lock()
 	renewedHooks.fs = append(renewedHooks.fs, f)
@@ -465,12 +540,58 @@ var renewedHooks struct {
 // holds it no more.
 func renewedNow(agent, user string) {
 	forgetAllowance(agent, user)
+	tellRenewed(agent, user)
+}
+
+// tellRenewed tells those OnRenewed asked.
+func tellRenewed(agent, user string) {
 	renewedHooks.Lock()
 	fs := renewedHooks.fs
 	renewedHooks.Unlock()
 	for _, f := range fs {
 		f(agent, user)
 	}
+}
+
+// AwaitAllowance has agent's accounts read again unless a reading is out,
+// and waits, till ctx ends, for one that knows user: after a reset is
+// spent, routing then counts the account's windows started again, rather
+// than not known and behind the rest till a later request reads them
+// (#1491). A reading out already, begun before the reset, doesn't count
+// it, so another is asked for; three at most. It says whether user is
+// known now.
+func AwaitAllowance(ctx context.Context, agent, user string) bool {
+	c := &usedCache
+	knows := func() bool {
+		c.Lock()
+		defer c.Unlock()
+		for u := range c.m[agent] {
+			if strings.EqualFold(u, user) {
+				return true
+			}
+		}
+		return false
+	}
+	for range 3 {
+		Allowances(agent)
+		c.Lock()
+		done := c.loading[agent]
+		c.Unlock()
+		if done != nil {
+			select {
+			case <-done:
+			case <-ctx.Done():
+				return knows()
+			}
+		}
+		if knows() {
+			return true
+		}
+		if done == nil {
+			return false // read lately, and user wasn't in it
+		}
+	}
+	return knows()
 }
 
 // forgetAllowance leaves agent's account user out of the allowances last
@@ -483,6 +604,7 @@ func forgetAllowance(agent, user string) {
 		c.renewed = map[string]time.Time{}
 	}
 	c.renewed[agent+"/"+strings.ToLower(user)] = time.Now()
+	delete(c.seen, agent+"/"+strings.ToLower(user)) // told already, by renewedNow
 	if c.at != nil {
 		c.at[agent] = time.Time{}
 	}
@@ -501,10 +623,14 @@ func forgetAllowance(agent, user string) {
 }
 
 // StaleAllowance makes the next Allowances ask the vendor again for user's
-// allowance rather than trust what it last said: the account just
-// answered that it has run out.
+// allowance rather than trust what it last said, or what a reading out
+// now, asked before, comes back with: the account just answered that it
+// has run out.
 func StaleAllowance(agent, user string) {
 	key := agent + "/" + strings.ToLower(user)
+	if readsAsked() {
+		markStaleRead(agent, user) // read though allowances are read only when asked (#1518)
+	}
 	loginUsageCache.Lock()
 	delete(loginUsageCache.m, key)
 	delete(loginUsageCache.pending, key) // nor a reading asked for before
@@ -517,6 +643,7 @@ func StaleAllowance(agent, user string) {
 		for _, g := range gs {
 			if strings.EqualFold(g.User, user) {
 				delete(grokHomeUsage.m, g.Home)
+				delete(grokHomeUsage.pending, g.Home)
 			}
 		}
 		grokHomeUsage.Unlock()
@@ -524,6 +651,13 @@ func StaleAllowance(agent, user string) {
 	usedCache.Lock()
 	if usedCache.at != nil {
 		usedCache.at[agent] = time.Time{}
+	}
+	// a reading out now was asked before: read again once it is back
+	if usedCache.loading[agent] != nil {
+		if usedCache.stale == nil {
+			usedCache.stale = map[string]bool{}
+		}
+		usedCache.stale[agent] = true
 	}
 	usedCache.Unlock()
 }
@@ -566,7 +700,7 @@ func allowanceOf(ws []QuotaWindow, now time.Time) Allowance {
 		if w.Aside {
 			continue
 		}
-		l := Limit{Used: w.Used, Span: w.Span, Model: w.Model, Amount: w.Amount, Of: w.Limit, Unit: w.Unit, matches: w.matches, partial: w.partial}
+		l := Limit{Used: w.Used, Span: w.Span, Model: w.Model, Amount: w.Amount, Of: w.Limit, Unit: w.Unit, matches: w.matches, partial: w.partial, Name: w.Name}
 		if ids := families[w.Model]; ids != nil && w.Family != "" && w.matches == nil {
 			l.Model = ""
 			l.matches = func(model string) bool { return ids[model] }
@@ -576,6 +710,9 @@ func allowanceOf(ws []QuotaWindow, now time.Time) Allowance {
 			l.Resets = *w.ResetsAt
 		case w.ResetSecs > 0:
 			l.Resets = now.Add(time.Duration(w.ResetSecs) * time.Second)
+		}
+		if w.RunsOutAt != nil {
+			l.RunsOut = *w.RunsOutAt
 		}
 		a = append(a, l)
 	}

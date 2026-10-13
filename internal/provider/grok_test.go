@@ -4,14 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 func TestParseGrokModels(t *testing.T) {
@@ -23,6 +28,82 @@ func TestParseGrokModels(t *testing.T) {
 	if len(ms) != 2 || ms[0].ID != "grok-4.7" || ms[0].Name != "Grok 4.7" || ms[0].Context != 500000 ||
 		strings.Join(ms[0].Efforts, ",") != "low,medium,high,xhigh" || ms[1].Name != "grok-4.7-build-fast" || ms[1].Efforts != nil {
 		t.Fatalf("models = %+v", ms)
+	}
+}
+
+// A model Grok lists at more than one context window is offered at each,
+// as the CLI's /context-window offers it (#1608): the default keeps the
+// plain id, 500K is grok-4.7@500k. The literal list is Grok 1.0.50's
+// models_cache.json from the report.
+func TestParseGrokModelsWindows(t *testing.T) {
+	b := []byte(`{"object":"list","data":[
+		{"id":"grok-4.7","name":"Grok 4.7","context_window":256000,"context_windows":[256000,500000],"api_backend":"responses","reasoning_efforts":[{"value":"high"},{"value":"low"}]},
+		{"id":"grok-4.5","context_window":256000,"context_windows":[256000],"api_backend":"responses"},
+		{"id":"grok-odd","context_window":100000,"context_windows":[200000,400000,400000],"api_backend":"responses"}]}`)
+	var got []string
+	for _, m := range parseGrokModels(b) {
+		got = append(got, fmt.Sprintf("%s|%s|%d|%s", m.ID, m.Name, m.Context, strings.Join(m.Efforts, ",")))
+	}
+	want := []string{
+		"grok-4.7|Grok 4.7|256000|low,high", "grok-4.7@500k|Grok 4.7 @ 500k|500000|low,high",
+		"grok-4.5|grok-4.5|256000|",
+		// a default the list doesn't hold goes to the list's first
+		"grok-odd|grok-odd|200000|", "grok-odd@400k|grok-odd @ 400k|400000|"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("models =\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+// A model at a window of its own goes to Grok as the model it lists, with
+// the window in x-grok-context-window, as the CLI sends it (#1608); the
+// plain id goes as it is, with no window.
+func TestGrokSignsWindow(t *testing.T) {
+	home := t.TempDir()
+	grokSignedIn(t, home, "me@x.ai")
+	acct := &Account{Agent: "grok"}
+	grokSigned(acct, home)
+	for _, c := range []struct{ model, sent, window string }{
+		{"grok-4.7@500k", "grok-4.7", "500000"},
+		{"grok-4.7", "grok-4.7", ""},
+		{"grok-4.7@big", "grok-4.7@big", ""},
+	} {
+		body := []byte(`{"model":"` + c.model + `","input":"hi","prompt_cache_key":"c1"}`)
+		req, _ := http.NewRequest("POST", "http://grok.invalid/responses", strings.NewReader(string(body)))
+		if err := acct.sign(context.Background(), req, body); err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(req.Body)
+		var v map[string]any
+		if err := json.Unmarshal(b, &v); err != nil || v["model"] != c.sent || v["input"] != "hi" || req.ContentLength != int64(len(b)) {
+			t.Errorf("%s: body = %s (%d)", c.model, b, req.ContentLength)
+		}
+		if req.Header.Get("x-grok-model-override") != c.sent || req.Header.Get("x-grok-context-window") != c.window ||
+			req.Header.Get("x-grok-conv-id") != "c1" {
+			t.Errorf("%s: headers = %v", c.model, req.Header)
+		}
+	}
+}
+
+// A window the id names without a k (131072: grokWindowLabel writes a
+// window that no multiple of 1000 is as bare digits) is signed as that
+// window at the model Grok lists, not sent as an id of its own.
+func TestGrokSignsWindowWithoutK(t *testing.T) {
+	home := t.TempDir()
+	grokSignedIn(t, home, "me@x.ai")
+	acct := &Account{Agent: "grok"}
+	grokSigned(acct, home)
+	for _, c := range []struct{ model, sent, window string }{
+		{"grok-4.7@131072", "grok-4.7", "131072"},
+		{"grok-4.7@500k", "grok-4.7", "500000"},
+	} {
+		body := []byte(`{"model":"` + c.model + `","input":"hi"}`)
+		req, _ := http.NewRequest("POST", "http://grok.invalid/responses", strings.NewReader(string(body)))
+		if err := acct.sign(context.Background(), req, body); err != nil {
+			t.Fatal(err)
+		}
+		if req.Header.Get("x-grok-model-override") != c.sent || req.Header.Get("x-grok-context-window") != c.window {
+			t.Errorf("%s: headers = %v, want %s at window %s", c.model, req.Header, c.sent, c.window)
+		}
 	}
 }
 
@@ -230,9 +311,7 @@ func TestGrokExecutableFinds(t *testing.T) {
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(p, []byte("#!/bin/sh\n"), 0o755); err != nil {
-			t.Fatal(err)
-		}
+		testenv.Program(t, p, "#!/bin/sh\n")
 		return p
 	}
 	npm := filepath.Join(home, "npm")
@@ -264,6 +343,34 @@ func TestGrokExecutableFinds(t *testing.T) {
 // object branches' properties are merged, $refs to $defs read, a field all
 // of them require stays required, the non-object branches go. One that is
 // an object already is left as it is.
+// TestObjectRootKeepsOwnRequired: the root's and allOf's own required
+// fields stay required beside anyOf's and oneOf's branches, which only add
+// the fields they all require.
+func TestObjectRootKeepsOwnRequired(t *testing.T) {
+	var ps map[string]any
+	if err := json.Unmarshal([]byte(`{
+		"type": "object",
+		"properties": {"id": {"type": "string"}},
+		"required": ["id"],
+		"allOf": [{"properties": {"kind": {"type": "string"}}, "required": ["kind"]}],
+		"anyOf": [
+			{"type": "object", "properties": {"a": {"type": "string"}, "n": {"type": "integer"}}, "required": ["a", "n"]},
+			{"type": "object", "properties": {"b": {"type": "string"}}, "required": ["b", "n", "id"]}
+		]
+	}`), &ps); err != nil {
+		t.Fatal(err)
+	}
+	if !ObjectRoot(ps) {
+		t.Fatal("not changed")
+	}
+	if got := fmt.Sprint(ps["required"]); got != "[id kind n]" {
+		t.Fatalf("required = %s", got)
+	}
+	if props := ps["properties"].(map[string]any); len(props) != 5 {
+		t.Fatalf("properties = %v", props)
+	}
+}
+
 func TestGrokBodyObjectRoot(t *testing.T) {
 	in := []byte(`{"tools":[
 		{"type":"function","name":"mcp__codex_app__automation_update","parameters":{"anyOf":[
@@ -301,5 +408,122 @@ func TestGrokBodyObjectRoot(t *testing.T) {
 	same := []byte(`{"tools":[{"type":"function","name":"x","parameters":{"type":"object","properties":{}}}]}`)
 	if string(grokBody(same)) != string(same) {
 		t.Fatal("an object root was changed")
+	}
+}
+
+// TestObjectRootNestedUnion: Codex desktop's automation_update, whose
+// parameters are zod's discriminated union on mode with the create and
+// update branches each a union on kind of their own (toJSONSchema with
+// reused: "ref", as ChatGPT.app 26.930 builds it; #1271). Folded to an
+// object root, the nested branches' fields are kept, so a model can still
+// create an automation, and a field the branches type apart (mode, kind)
+// takes any of their types, not the first branch's alone; only mode,
+// which every branch requires, stays required.
+func TestObjectRootNestedUnion(t *testing.T) {
+	b, err := os.ReadFile("testdata/codex_automation_update_schema.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ps map[string]any
+	if err := json.Unmarshal(b, &ps); err != nil {
+		t.Fatal(err)
+	}
+	if !ObjectRoot(ps) {
+		t.Fatal("not changed")
+	}
+	if ps["type"] != "object" || ps["anyOf"] != nil || ps["oneOf"] != nil {
+		t.Fatalf("root %v", ps)
+	}
+	props, _ := ps["properties"].(map[string]any)
+	for _, k := range []string{"mode", "id", "name", "prompt", "rrule", "status", "kind", "projectId", "model", "targetThreadId", "executionEnvironment"} {
+		if props[k] == nil {
+			t.Errorf("no %s among %v", k, slices.Sorted(maps.Keys(props)))
+		}
+	}
+	if got := fmt.Sprint(ps["required"]); got != "[mode]" {
+		t.Errorf("required = %s", got)
+	}
+	// every mode a branch takes can still be sent
+	mode, _ := json.Marshal(props["mode"])
+	for _, m := range []string{`"view"`, `"delete"`, `__schema11`} {
+		if !strings.Contains(string(mode), m) {
+			t.Errorf("mode %s leaves out %s", mode, m)
+		}
+	}
+	kind, _ := json.Marshal(props["kind"])
+	if !strings.Contains(string(kind), "__schema7") || !strings.Contains(string(kind), "__schema12") {
+		t.Errorf("kind %s", kind)
+	}
+}
+
+// A plain Codex agent_message, which Grok's backend refuses with 422
+// "unknown item type", goes as the user's message: its sender and
+// recipient said first, its text and images as they came, in its place
+// among the calls beside it; a request without tools too. The plugin
+// does the same (opencode-grok-auth 0.1.11, plugins#61).
+func TestGrokBodyAgentMessageGoesAsUser(t *testing.T) {
+	task := `{"type":"agent_message","author":"/root","recipient":"/root/research","content":[{"type":"input_text","text":"Message Type: NEW_TASK\nPayload:\nresearch the failure"}]}`
+	want := `{"input":[{"content":[{"text":"From /root to /root/research\n\n","type":"input_text"},{"text":"Message Type: NEW_TASK\nPayload:\nresearch the failure","type":"input_text"}],"role":"user","type":"message"}]}`
+	if got := string(grokBody([]byte(`{"input":[` + task + `]}`))); got != want {
+		t.Fatalf("task:\ngot  %s\nwant %s", got, want)
+	}
+
+	before := `{"type":"function_call","call_id":"call_1","name":"send_message","arguments":"{}"}`
+	after := `{"type":"function_call_output","call_id":"call_1","output":"sent"}`
+	reply := `{"type":"agent_message","author":"/root/research","recipient":"/root","content":[{"type":"input_text","text":"Message Type: FINAL_ANSWER\nPayload:\nfound the cause"},{"type":"input_image","image_url":"data:image/png;base64,fixture"}]}`
+	var got struct {
+		Input []map[string]any `json:"input"`
+	}
+	if err := json.Unmarshal(grokBody([]byte(`{"tools":[],"input":[`+before+`,`+reply+`,`+after+`]}`)), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Input) != 3 || got.Input[0]["type"] != "function_call" || got.Input[2]["type"] != "function_call_output" || got.Input[2]["call_id"] != "call_1" {
+		t.Fatalf("input %v", got.Input)
+	}
+	msg, _ := json.Marshal(got.Input[1])
+	if w := `{"content":[{"text":"From /root/research to /root\n\n","type":"input_text"},{"text":"Message Type: FINAL_ANSWER\nPayload:\nfound the cause","type":"input_text"},{"image_url":"data:image/png;base64,fixture","type":"input_image"}],"role":"user","type":"message"}`; string(msg) != w {
+		t.Fatalf("reply:\ngot  %s\nwant %s", msg, w)
+	}
+
+	// one sender alone, or none, says what it has
+	for in, w := range map[string]string{
+		`{"type":"agent_message","author":"/root","content":[{"type":"input_text","text":"x"}]}`:    `[{"text":"From /root\n\n","type":"input_text"},{"text":"x","type":"input_text"}]`,
+		`{"type":"agent_message","recipient":"/root","content":[{"type":"input_text","text":"x"}]}`: `[{"text":"To /root\n\n","type":"input_text"},{"text":"x","type":"input_text"}]`,
+		`{"type":"agent_message","content":[{"type":"input_text","text":"x"}]}`:                     `[{"text":"x","type":"input_text"}]`,
+	} {
+		var g struct {
+			Input []struct {
+				Type    string          `json:"type"`
+				Content json.RawMessage `json:"content"`
+			} `json:"input"`
+		}
+		json.Unmarshal(grokBody([]byte(`{"input":[`+in+`]}`)), &g)
+		if len(g.Input) != 1 || g.Input[0].Type != "message" || string(g.Input[0].Content) != w {
+			t.Errorf("%s\n-> %+v", in, g.Input)
+		}
+	}
+}
+
+// A sealed, empty or unknown agent_message is never converted or dropped:
+// the gateway's guard for a sealed task still sees it. A history with
+// none goes byte for byte.
+func TestGrokBodyLeavesSealedAgentMessage(t *testing.T) {
+	for _, item := range []string{
+		`{"type":"agent_message","content":[{"type":"encrypted_content","encrypted_content":"sealed fixture"}]}`,
+		`{"type":"agent_message","content":[{"type":"input_text","text":"header"},{"type":"encrypted_content","encrypted_content":"sealed fixture"}]}`,
+		`{"type":"agent_message","content":[{"type":"input_text","encrypted_content":"sealed fixture"}]}`,
+		`{"type":"agent_message","encrypted_content":"sealed fixture","content":[{"type":"input_text","text":"header"}]}`,
+		`{"type":"agent_message","content":[{"type":"future_content","payload":"keep me"}]}`,
+		`{"type":"agent_message","content":[]}`,
+		`{"type":"agent_message","content":null}`,
+	} {
+		body := `{"input":[` + item + `]}`
+		if got := string(grokBody([]byte(body))); got != body {
+			t.Errorf("%s\n-> %s", body, got)
+		}
+	}
+	same := `{ "input": [{"type":"message","role":"user","content":"hello"}] }`
+	if got := string(grokBody([]byte(same))); got != same {
+		t.Fatalf("an ordinary history was changed: %s", got)
 	}
 }

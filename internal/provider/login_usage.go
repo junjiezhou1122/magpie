@@ -6,10 +6,12 @@ package provider
 
 import (
 	"context"
-	"os"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yetone/magpie/internal/settings"
 )
 
 var loginUsageCache struct {
@@ -34,12 +36,31 @@ type loginRead struct {
 }
 
 // loginUsageFor, when set, stands in for LoginUsage's readings (tests),
-// as UsageClaudeVia does for Claude's own.
-var loginUsageFor func(ctx context.Context, agent string) map[string]SubscriptionQuota
+// as UsageClaudeVia does for Claude's own. It is held for reading while it
+// runs: Allowances reads in the background and returns without waiting,
+// so a reading it began can outlast the test that set the stand-in.
+var loginUsageFor struct {
+	sync.RWMutex
+	f func(ctx context.Context, agent string) map[string]SubscriptionQuota
+}
 
-// LoginUsageVia has tests stand in for LoginUsage's readings.
+// LoginUsageVia has tests stand in for LoginUsage's readings. It returns
+// once no reading is still running through the one it replaces, and none
+// starts through it after.
 func LoginUsageVia(f func(ctx context.Context, agent string) map[string]SubscriptionQuota) {
-	loginUsageFor = f
+	loginUsageFor.Lock()
+	loginUsageFor.f = f
+	loginUsageFor.Unlock()
+}
+
+// loginUsageStandIn is the stand-in's reading, and false when there is none.
+func loginUsageStandIn(ctx context.Context, agent string) (map[string]SubscriptionQuota, bool) {
+	loginUsageFor.RLock()
+	defer loginUsageFor.RUnlock()
+	if loginUsageFor.f == nil {
+		return nil, false
+	}
+	return loginUsageFor.f(ctx, agent), true
 }
 
 // LoginUsage is the allowance used by each of an agent's accounts, by
@@ -47,35 +68,84 @@ func LoginUsageVia(f func(ctx context.Context, agent string) map[string]Subscrip
 // comes from the cache; the rest is asked for at once, as long as ctx
 // allows.
 func LoginUsage(ctx context.Context, agent string) map[string]SubscriptionQuota {
-	if loginUsageFor != nil {
-		return loginUsageFor(ctx, agent)
+	out, _ := loginUsageAt(ctx, agent)
+	return out
+}
+
+// loginUsageAt is LoginUsage and when the oldest of its readings was made:
+// one taken from the cache is up to a minute old already, and Allowances
+// counts its own minute from then, not from when it asked (#1295).
+func loginUsageAt(ctx context.Context, agent string) (map[string]SubscriptionQuota, time.Time) {
+	if settings.AccountDiscoveryOff() {
+		return nil, time.Time{}
+	}
+	asked := time.Now()
+	if out, ok := loginUsageStandIn(ctx, agent); ok {
+		return out, asked
 	}
 	out := map[string]SubscriptionQuota{}
 	if agent == "grok" {
 		if _, ok := pluginOfAgent(agent); !ok {
-			return grokLoginUsage(ctx)
+			return grokLoginUsage(ctx), asked
 		}
 	}
 	logins, ok := usageLogins(agent)
 	if !ok {
-		return out
+		return out, asked
 	}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
+	oldest := asked
 	for _, l := range logins {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			q := loginReading(ctx, l).q
+			e := loginReading(ctx, l)
 			mu.Lock()
-			out[l.User] = q
+			out[l.User] = e.q
+			if e.q.Error == "" && e.at.Before(oldest) {
+				oldest = e.at
+			}
 			mu.Unlock()
 		}()
 	}
 	wg.Wait()
 	usageRead(agent, out) // a window not started: the warm-up looks now
-	return out
+	if len(out) > 0 {
+		// the batch's readings are points of each account's quota history
+		// too, as a Usage-page reading is: a magpie only ever serving
+		// other magpies has nobody on its Usage page, and its quota
+		// history stayed empty otherwise (#1313). One note for the whole
+		// batch: the file is read, parsed and written once for all
+		// accounts. The note runs after every reading of the batch has
+		// completed and released its in-flight marker, so no waiter on a
+		// reading is held by a slow disk; the LoginUsage caller pays for
+		// the write, and Allowances already calls it from its own
+		// background goroutine. A detached goroutine is deliberately not
+		// used: it would outlive the caller and write after tests and
+		// commands have moved on (#1318 review). A cached reading notes
+		// nothing new, its ReadAt no newer than what is kept; a failed
+		// one is skipped.
+		qs := make([]SubscriptionQuota, 0, len(out))
+		for user, q := range out {
+			q.User = user // a login's reading itself carries no user
+			qs = append(qs, q)
+		}
+		noteHistory(qs, time.Now())
+	}
+	return out, oldest
 }
+
+// noteHistory notes a batch of accounts' readings in the quota history.
+// The write is synchronous: it runs after the batch's readings have all
+// completed, so it holds no waiter on a reading. Tests substitute their
+// own note or write.
+var noteHistory = func(qs []SubscriptionQuota, now time.Time) {
+	noteHistoryWrite(qs, now)
+}
+
+// noteHistoryWrite is the history write itself; tests count or hold it.
+var noteHistoryWrite = noteQuotaHistory
 
 // loginReading is l's allowance as LoginUsage and the Usage page both show
 // it, one reading for the two: what was read less than a minute ago comes
@@ -85,10 +155,23 @@ func LoginUsage(ctx context.Context, agent string) map[string]SubscriptionQuota 
 func loginReading(ctx context.Context, l Login) loginUsageEntry {
 	key := l.Agent + "/" + strings.ToLower(l.User)
 	c := &loginUsageCache
+	// with allowances read only when asked, one nobody asked for is what
+	// was read last, however old, unless the vendor just turned the
+	// account away for its quota (StaleAllowance), which is read (#1518)
+	stale := false
+	if holding(ctx) {
+		if stale = isStaleRead(key); stale {
+			ctx = unheld(ctx)
+		}
+	}
+	held := holding(ctx)
 	c.Lock()
 	e, ok := c.m[key]
-	if ok && time.Since(e.at) < time.Minute {
+	if ok && (held || time.Since(e.at) < time.Minute) {
 		c.Unlock()
+		if held {
+			e.at = time.Now() // as good as it gets until asked: Allowances keeps it its minute
+		}
 		return e
 	}
 	entry := func(read SubscriptionQuota) loginUsageEntry {
@@ -99,15 +182,24 @@ func loginReading(ctx context.Context, l Login) loginUsageEntry {
 		return loginUsageEntry{time.Now(), q, read}
 	}
 	r := c.pending[key]
+	if r == nil && held {
+		// nothing read since magpie started: the reading kept on disk,
+		// as of when it was made
+		c.Unlock()
+		return entry(keepLast(SubscriptionQuota{Provider: loginProvider(l), Plan: l.Plan, Windows: []QuotaWindow{}, Error: errNotAsked.Error()}, l.User))
+	}
 	if r == nil {
+		if stale {
+			takeStaleRead(key)
+		}
 		r = &loginRead{done: make(chan struct{})}
 		if c.pending == nil {
 			c.pending = map[string]*loginRead{}
 		}
 		c.pending[key] = r
 		ctx, _ = quotaReading(ctx)
+		asked := claudeAskGeneration.Load()
 		go func() {
-			start := time.Now()
 			// read for all who wait for it: no one's ctx cuts it short, but
 			// it is bounded as the Usage page's refresh is
 			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), subscriptionTimeout)
@@ -119,7 +211,7 @@ func loginReading(ctx context.Context, l Login) loginUsageEntry {
 			// (AskClaudeUsage), as SubscriptionUsage reads it: neither is kept
 			if c.pending[key] == r {
 				delete(c.pending, key)
-				if l.Agent != "claude" || claudeAsked.Load() <= start.UnixNano() {
+				if l.Agent != "claude" || claudeAskGeneration.Load() == asked {
 					if c.m == nil {
 						c.m = map[string]loginUsageEntry{}
 					}
@@ -136,7 +228,7 @@ func loginReading(ctx context.Context, l Login) loginUsageEntry {
 		return r.e
 	case <-ctx.Done():
 		// given up on: as a reading cut short would have said
-		return entry(keepLast(SubscriptionQuota{Provider: loginProvider(l), Plan: l.Plan, Windows: []QuotaWindow{}, Error: ctx.Err().Error()}, l.User))
+		return entry(keepReading(ctx, SubscriptionQuota{Provider: loginProvider(l), Plan: l.Plan, Windows: []QuotaWindow{}, Error: ctx.Err().Error()}, l.User))
 	}
 }
 
@@ -246,8 +338,27 @@ func loginQuota(ctx context.Context, l Login) SubscriptionQuota {
 	if l.Agent == "copilot" {
 		for _, c := range copilotLogins(copilotConfigDir()) {
 			if strings.EqualFold(c.User, l.User) {
+				orig := c.app
 				q := copilotSubscriptionUsage(ctx, c.app.Token, c.app.Host)
+				// an editor's stale token, the CLI signed in to the same
+				// account: read as the requests are sent (#1238)
+				if q.Error == http.StatusText(http.StatusUnauthorized) {
+					if cli, ok := copilotStandIn(c.app); ok {
+						copilotRefuse(c.app.Token, http.StatusUnauthorized)
+						c.app = cli
+						q = copilotSubscriptionUsage(ctx, cli.Token, cli.Host)
+					}
+				}
+				// GitHub refused the token, with none in its place: the
+				// account is signed out (echo_ts on Discord)
+				if q.Error == http.StatusText(http.StatusUnauthorized) {
+					copilotRefuse(orig.Token, http.StatusUnauthorized)
+					copilotRefuse(c.app.Token, http.StatusUnauthorized)
+					copilotLapse(orig)
+					q.Error = copilotLapsedText
+				}
 				if q.Error == "" {
+					copilotUnlapse(orig)
 					refreshCopilotEntitlement(c.app, q.Plan, q.AccessSKU)
 				}
 				return q
@@ -257,7 +368,8 @@ func loginQuota(ctx context.Context, l Login) SubscriptionQuota {
 	}
 	q := SubscriptionQuota{Provider: l.Agent, Plan: l.Plan, Windows: []QuotaWindow{}}
 	if l.Agent == "claude" && !l.Active {
-		// a saved account is never asked: what Claude Code told of it
+		// a saved account: what Claude Code told of it, or, when its card
+		// is refreshed, its /usage run in the account's own directory
 		ws, err := claudeWindows(ctx, l.User, false)
 		q.Windows = ws
 		if err != nil {
@@ -316,7 +428,7 @@ func CodexUsedUp(ctx context.Context) bool {
 // file Codex is signed in with, or the one kept for it.
 func codexLoginAuth(l Login) []byte {
 	if l.Active {
-		b, _ := os.ReadFile(codexAuthPath())
+		b, _ := readAccountFile(codexAuthPath())
 		return b
 	}
 	loginsMu.Lock()

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -20,6 +19,7 @@ import (
 	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/proc"
 	"gopkg.in/yaml.v3"
 )
@@ -57,6 +57,9 @@ type rtkSpec struct {
 	// withClaude: the installer gives it to Claude Code too, which is
 	// pointed at a folder thrown away after
 	withClaude bool
+	// env is what the installer is run with besides magpie's own
+	// environment, so it writes where the agent reads
+	env func(a *agent.Agent) []string
 	// blocked says why rtk's installer mustn't be run for the agent as it
 	// is on this machine, "" when it can be
 	blocked func() string
@@ -171,16 +174,22 @@ var rtkSpecs = map[string]rtkSpec{
 	},
 	"pi":  extensionSpec("pi"),
 	"omp": extensionSpec("omp"),
+	// Hermes's folder is the agent's (appdir.HermesHome): $HERMES_HOME,
+	// else %LOCALAPPDATA%\hermes on Windows and ~/.hermes elsewhere. rtk
+	// (0.51, src/hooks/init/hermes.rs) knows only $HERMES_HOME and
+	// ~/.hermes, so it is told the folder: on Windows it otherwise writes
+	// its plugin where Hermes doesn't look (新v学员 on Discord).
 	"hermes": {
 		flags: []string{"--agent", "hermes"}, patch: true,
-		has: func(*agent.Agent) bool { return exists(filepath.Join(hermesPlugin(), "plugin.yaml")) },
-		files: func(*agent.Agent) []string {
-			return []string{filepath.Join(home(), ".hermes", "config.yaml"), filepath.Join(hermesPlugin(), "plugin.yaml"), filepath.Join(hermesPlugin(), "__init__.py")}
+		has: func(a *agent.Agent) bool { return exists(filepath.Join(hermesPlugin(a), "plugin.yaml")) },
+		files: func(a *agent.Agent) []string {
+			return []string{filepath.Join(a.Dir, "config.yaml"), filepath.Join(hermesPlugin(a), "plugin.yaml"), filepath.Join(hermesPlugin(a), "__init__.py")}
 		},
-		remove: func(*agent.Agent) error {
-			return errors.Join(os.RemoveAll(hermesPlugin()), dropHermesPlugin(filepath.Join(home(), ".hermes", "config.yaml")))
+		remove: func(a *agent.Agent) error {
+			return errors.Join(os.RemoveAll(hermesPlugin(a)), dropHermesPlugin(filepath.Join(a.Dir, "config.yaml")))
 		},
-		dir: func(*agent.Agent) string { return filepath.Join(home(), ".hermes") },
+		dir: func(a *agent.Agent) string { return a.Dir },
+		env: func(a *agent.Agent) []string { return []string{"HERMES_HOME=" + a.Dir} },
 	},
 }
 
@@ -197,6 +206,12 @@ var rtkSpecs = map[string]rtkSpec{
 // instructions to AGENTS.md, which rewrite nothing).
 var rtkNoHook = map[string]string{
 	"dsh": "RTK has no hook for DeepSeek Harness yet: RTK works by rewriting the shell command an agent is about to run, and dsh's hooks can only allow or deny a command, not change it; rtk init has no --agent dsh either (github.com/rtk-ai/rtk/issues/3847)",
+	// rtk init's agents are claude, cursor, codex, copilot, gemini,
+	// opencode and the rest of rtkSpecs. There is no grok or grok-app,
+	// so a hook written here would have nowhere to go, for Grok Build no
+	// more than for the App that runs it.
+	"grok":     "RTK has no hook for Grok Build yet: rtk init has no Grok agent, so it cannot rewrite the shell commands Grok Build runs",
+	"grok-app": "RTK has no hook for Grok App yet: rtk init has no Grok or Grok App agent, so it cannot rewrite the shell commands Grok App runs",
 }
 
 func opencodePlugin(a *agent.Agent) string {
@@ -270,7 +285,7 @@ var openCodeVersion = func() string {
 	if runtime.GOOS == "windows" {
 		name = "opencode.exe"
 	}
-	bin, err := exec.LookPath("opencode")
+	bin, err := proc.Look("opencode")
 	if err != nil {
 		bin = filepath.Join(home(), ".opencode", "bin", name)
 		if !exists(bin) {
@@ -291,7 +306,7 @@ var openCodeVersion = func() string {
 	return ""
 }
 
-func hermesPlugin() string { return filepath.Join(home(), ".hermes", "plugins", "rtk-rewrite") }
+func hermesPlugin(a *agent.Agent) string { return filepath.Join(a.Dir, "plugins", "rtk-rewrite") }
 
 // extensionSpec is pi's and omp's: an extension of rtk's own, and nothing else.
 func extensionSpec(id string) rtkSpec {
@@ -507,6 +522,16 @@ type RTKView struct {
 	// doesn't know how this rtk was installed
 	Latest  string `json:"latest,omitempty"`
 	Upgrade string `json:"upgrade,omitempty"`
+	// Admin is the folder rtk is in when only an administrator can change
+	// it (winget's for every user, under Program Files): Upgrade asks
+	// Windows for one first
+	Admin string `json:"admin,omitempty"`
+	// Waiting is the package manager this rtk was installed with (winget,
+	// Homebrew) when Latest is out but it has nothing newer than this rtk
+	// yet, WaitingHas what it has: an upgrade through it would change
+	// nothing, so the page offers none (#1025)
+	Waiting    string `json:"waiting,omitempty"`
+	WaitingHas string `json:"waitingHas,omitempty"`
 	// Note is what an upgrade left to say: Homebrew's rtk behind rtk's
 	// own release
 	Note string `json:"note,omitempty"`
@@ -536,7 +561,7 @@ var rtkMu sync.Mutex
 // winget could make the link. Found there, it may not be on the PATH the
 // agents get: see rtkReached.
 func rtkPath() string {
-	if p, err := exec.LookPath("rtk"); err == nil {
+	if p, err := proc.Look("rtk"); err == nil {
 		return p
 	}
 	name, dirs := "rtk", []string{filepath.Join(home(), ".local", "bin"), filepath.Join(home(), ".cargo", "bin")}
@@ -629,8 +654,8 @@ func ReadRTK() *RTKView {
 	if out, err := rtkRun(v.Path, "--version"); err == nil {
 		v.Version = strings.TrimSpace(strings.TrimPrefix(out, "rtk"))
 	}
-	if c := rtkUpgrader(v.Path); c != nil {
-		v.Upgrade = shown(c)
+	if c := upgraderOf(v.Path); c != nil {
+		v.Upgrade, v.Admin = shown(c), rtkAdminFolder(c, v.Path)
 	}
 	v.Gain, v.Days, v.GainErr = rtkGain(v.Path)
 	if runtime.GOOS == "windows" {
@@ -710,11 +735,17 @@ func parseGain(out string) (*RTKGain, []RTKDay, string) {
 // of them keeps its history in that account's AppData, not the user's;
 // "unelevated" runs them with a token that can't write the user's. Either
 // way rtk gain here doesn't count them. "" when Codex doesn't sandbox them.
+// It is parsed again only when config.toml changes: one with a table for
+// each of thousands of projects is ~0.2s of CPU to parse (#1665).
 func codexSandbox() string {
-	raw, err := os.ReadFile(filepath.Join(codexDir(), "config.toml"))
-	if err != nil {
-		return ""
-	}
+	s, _ := filememo.Read("rtk codex sandbox", filepath.Join(codexDir(), "config.toml"), func(raw []byte) (string, error) {
+		return codexSandboxIn(raw), nil
+	})
+	return s
+}
+
+// codexSandboxIn is codexSandbox of config.toml's bytes.
+func codexSandboxIn(raw []byte) string {
 	var c struct {
 		SandboxMode string `toml:"sandbox_mode"`
 		Windows     struct {
@@ -822,6 +853,9 @@ func rtkInstall(bin string, a *agent.Agent) error {
 		defer os.RemoveAll(tmp)
 		env = []string{"CLAUDE_CONFIG_DIR=" + tmp}
 	}
+	if sp.env != nil {
+		env = append(env, sp.env(a)...)
+	}
 	out, err := rtkRunEnv(bin, env, args...)
 	if err != nil {
 		return err
@@ -839,15 +873,15 @@ const rtkScript = "https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/maste
 // one, winget on Windows, else rtk's own script; nil when there's no way.
 func rtkInstaller() []string {
 	if runtime.GOOS == "windows" {
-		if _, err := exec.LookPath("winget"); err == nil {
+		if _, err := proc.Look("winget"); err == nil {
 			return []string{"winget", "install", "--id", "rtk-ai.rtk", "--exact", "--silent", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"}
 		}
 		return nil
 	}
-	if _, err := exec.LookPath("brew"); err == nil {
+	if _, err := proc.Look("brew"); err == nil {
 		return []string{"brew", "install", "rtk"}
 	}
-	if _, err := exec.LookPath("curl"); err == nil {
+	if _, err := proc.Look("curl"); err == nil {
 		return []string{"sh", "-c", "curl -fsSL " + rtkScript + " | sh"}
 	}
 	return nil
@@ -864,7 +898,7 @@ func InstallRTK() (*RTKView, error) {
 	if c == nil {
 		return nil, fmt.Errorf("no way to install rtk here — get it from %s", RTKURL)
 	}
-	out, err := runInstaller(c, 5*time.Minute, "HOMEBREW_NO_AUTO_UPDATE=1")
+	out, err := runRTKInstaller(c, 5*time.Minute, "", "HOMEBREW_NO_AUTO_UPDATE=1")
 	if err != nil {
 		return nil, err
 	}

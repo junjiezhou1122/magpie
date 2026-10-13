@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/provider"
@@ -80,7 +81,7 @@ func TestEffortFields(t *testing.T) {
 	// env (TestClaudeEffortMax)
 	setEffort(t, c, "max", `"theme"`)
 
-	writeFile(t, filepath.Join(home, ".hermes", "config.yaml"), "model:\n  default: x\nagent:\n  max_turns: 9\n")
+	writeFile(t, filepath.Join(appdir.HermesHomeIn(home), "config.yaml"), "model:\n  default: x\nagent:\n  max_turns: 9\n")
 	h := hermes(home)
 	setEffort(t, h, "none", "max_turns: 9")
 	if v, _ := edit.GetYAML(h.Path, "model.default"); v != "x" {

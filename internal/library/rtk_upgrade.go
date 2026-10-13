@@ -41,11 +41,150 @@ var rtkLatest struct {
 	next time.Time
 }
 
-// CheckLatest fills in rtk's latest release (see RTKLatest).
+// CheckLatest fills in rtk's latest release (see RTKLatest) and, when it
+// is newer than this rtk, whether the package manager that installed it has
+// it yet (Waiting): winget and Homebrew take days to have a release GitHub
+// has, and until they do an upgrade through them changes nothing (#1025).
 func (v *RTKView) CheckLatest() {
-	if v.Path != "" {
-		v.Latest = RTKLatest()
+	if v.Path == "" {
+		return
 	}
+	v.Latest = RTKLatest()
+	if v.Latest == "" || v.Version == "" || !newer(v.Latest, v.Version) {
+		return
+	}
+	c := upgraderOf(v.Path)
+	ch := rtkChannelName(c)
+	if ch == "" {
+		return
+	}
+	// what it has, when it said: not knowing leaves Upgrade offered
+	if has := rtkChannelLatest(c); has != "" && !newer(has, v.Version) {
+		v.Waiting, v.WaitingHas = ch, has
+	}
+}
+
+// upgraderOf is rtkUpgrader; a var so tests can give an rtk winget's
+// upgrade on any platform, with a fake winget.
+var upgraderOf = rtkUpgrader
+
+// rtkChannelName is the package manager upgrade c runs, as the page names
+// it, when it is one whose rtk can lag behind rtk's GitHub release; "" for
+// cargo (built from rtk's own repository) and rtk's script (its releases).
+func rtkChannelName(c []string) string {
+	if len(c) == 0 {
+		return ""
+	}
+	switch c[0] {
+	case "brew":
+		return "Homebrew"
+	case "winget":
+		return "winget"
+	}
+	return ""
+}
+
+// rtkChannels is the newest rtk each package manager has, as last asked or
+// as an upgrade through it left: good for six hours, a failure (not known)
+// for fifteen minutes.
+var rtkChannels = struct {
+	sync.Mutex
+	m map[string]rtkChannel
+}{m: map[string]rtkChannel{}}
+
+type rtkChannel struct {
+	v    string
+	next time.Time
+}
+
+// rtkChannelLatest is the newest rtk the package manager upgrade c runs
+// has, "" when it didn't say.
+func rtkChannelLatest(c []string) string {
+	rtkChannels.Lock()
+	defer rtkChannels.Unlock()
+	if e, ok := rtkChannels.m[c[0]]; ok && time.Now().Before(e.next) {
+		return e.v
+	}
+	v, err := askRTKChannel(c)
+	if err != nil {
+		rtkChannels.m[c[0]] = rtkChannel{next: time.Now().Add(15 * time.Minute)}
+		return ""
+	}
+	rtkChannels.m[c[0]] = rtkChannel{v: v, next: time.Now().Add(6 * time.Hour)}
+	return v
+}
+
+// rtkChannelHas records what an upgrade through c found: the newest rtk it
+// has is the one now installed.
+func rtkChannelHas(c []string, v string) {
+	if rtkChannelName(c) == "" || v == "" {
+		return
+	}
+	rtkChannels.Lock()
+	rtkChannels.m[c[0]] = rtkChannel{v: v, next: time.Now().Add(6 * time.Hour)}
+	rtkChannels.Unlock()
+}
+
+// askRTKChannel asks Homebrew (as it last updated itself, as the Agents
+// page's update does) or winget (its source, as winget upgrade would) for
+// the newest rtk it has. Nothing is installed.
+func askRTKChannel(c []string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	var args []string
+	switch c[0] {
+	case "brew":
+		args = []string{"info", "--json=v2", "rtk"}
+	case "winget":
+		args = []string{"show", "--id", "rtk-ai.rtk", "--exact", "--accept-source-agreements", "--disable-interactivity"}
+	default:
+		return "", errors.New("no package manager")
+	}
+	cmd := proc.CommandContext(ctx, c[0], args...)
+	cmd.Stdin = nil
+	cmd.Env = append(os.Environ(), "HOMEBREW_NO_AUTO_UPDATE=1", "HOMEBREW_NO_ENV_HINTS=1", "NONINTERACTIVE=1")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return rtkChannelVersion(c[0], string(out))
+}
+
+// rtkChannelVersion reads the version out of brew info --json=v2 or winget
+// show. winget's labels are in the system's language ("Version:",
+// "版本:"), so its version is the first one after the line naming the
+// package, which comes right before it.
+func rtkChannelVersion(tool, out string) (string, error) {
+	if tool == "brew" {
+		var r struct {
+			Formulae []struct {
+				Versions struct{ Stable string }
+			}
+		}
+		if err := json.Unmarshal([]byte(out), &r); err != nil {
+			return "", err
+		}
+		if len(r.Formulae) > 0 {
+			if m := semver.FindStringSubmatch(" " + r.Formulae[0].Versions.Stable); m != nil {
+				return m[1], nil
+			}
+		}
+		return "", errors.New("brew info says no version")
+	}
+	_, rest, ok := strings.Cut(out, "[rtk-ai.rtk]")
+	if !ok {
+		return "", errors.New("winget show doesn't name rtk-ai.rtk")
+	}
+	for _, l := range strings.FieldsFunc(rest, func(r rune) bool { return r == '\n' || r == '\r' }) {
+		if l = strings.TrimSpace(l); l == "" {
+			continue
+		}
+		if m := semver.FindStringSubmatch(l); m != nil {
+			return m[1], nil
+		}
+		break // the version is the line after the package's
+	}
+	return "", errors.New("winget show says no version")
 }
 
 // RTKLatest is rtk's latest release, from GitHub unless it was read lately;
@@ -131,20 +270,23 @@ func rtkUpgrader(bin string) []string {
 	have := func(name string) bool { _, err := exec.LookPath(name); return err == nil }
 	slash := filepath.ToSlash(real)
 	dir := filepath.Dir(bin)
+	wingetUp := []string{"winget", "upgrade", "--id", "rtk-ai.rtk", "--exact", "--silent", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"}
 	switch {
 	case strings.Contains(slash, "/Cellar/rtk/") || strings.Contains(slash, "/.linuxbrew/"):
 		if have("brew") {
 			return []string{"brew", "upgrade", "rtk"}
 		}
-	case runtime.GOOS == "windows" && strings.Contains(strings.ToLower(slash), "/winget/"):
+	// winget's own folders: its package, or the link it puts in
+	// WinGet\Links to one installed with --location (#1527)
+	case rtkOnWindows && (strings.Contains(strings.ToLower(slash), "/winget/") || strings.Contains(strings.ToLower(filepath.ToSlash(bin)), "/winget/")):
 		if have("winget") {
-			return []string{"winget", "upgrade", "--id", "rtk-ai.rtk", "--exact", "--silent", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"}
+			return wingetUp
 		}
 	case dir == filepath.Join(home(), ".cargo", "bin"):
 		if have("cargo") {
 			return []string{"cargo", "install", "--git", "https://github.com/rtk-ai/rtk", "--force"}
 		}
-	case runtime.GOOS != "windows":
+	case !rtkOnWindows:
 		// its own script, told the folder it is in (RTK_INSTALL_DIR): the
 		// one a link to it points into (Put RTK on PATH's), not the link's
 		if st, err := os.Lstat(bin); err == nil && st.Mode()&os.ModeSymlink != 0 {
@@ -153,8 +295,87 @@ func rtkUpgrader(bin string) []string {
 		if have("curl") {
 			return []string{"sh", "-c", "curl -fsSL " + rtkScript + " | sh", dir}
 		}
+	// installed with winget --location into a folder of the user's own
+	// (D:\codes\tools\rtk): winget's records say so, not the folder's name
+	case have("winget") && wingetOwnsRTK(bin, real):
+		return wingetUp
 	}
 	return nil
+}
+
+// rtkOnWindows is whether rtk is upgraded as Windows has it; a var so a
+// test can ask a fake winget on any platform.
+var rtkOnWindows = runtime.GOOS == "windows"
+
+// wingetRecords is where winget's records say it put rtk-ai.rtk: the
+// InstallLocation of its entries among Windows' installed programs, which
+// winget writes for a portable package like rtk's, wherever --location
+// put it. ok is false when they can't be read (not Windows). A var for
+// tests.
+var wingetRecords = rtkWingetLocations
+
+// rtkWingetOwned is whether winget installed the rtk at a path, as last
+// asked: asking can run winget, which takes seconds, and the Library page
+// reads rtk's card each time it is drawn.
+var rtkWingetOwned = struct {
+	sync.Mutex
+	m map[string]rtkOwned
+}{m: map[string]rtkOwned{}}
+
+type rtkOwned struct {
+	yes  bool
+	next time.Time
+}
+
+// wingetOwnsRTK says whether winget installed the rtk at bin (real, with
+// links followed), remembered for ten minutes.
+func wingetOwnsRTK(bin, real string) bool {
+	key := strings.ToLower(real)
+	rtkWingetOwned.Lock()
+	defer rtkWingetOwned.Unlock()
+	if o, ok := rtkWingetOwned.m[key]; ok && time.Now().Before(o.next) {
+		return o.yes
+	}
+	yes := askWingetOwns(bin, real)
+	rtkWingetOwned.m[key] = rtkOwned{yes: yes, next: time.Now().Add(10 * time.Minute)}
+	return yes
+}
+
+// askWingetOwns asks winget's records whether the rtk at bin is the one it
+// installed: the folder its record names holds it, so an rtk.exe put
+// somewhere else by hand isn't taken for winget's. When there is no record
+// to read, winget list --id rtk-ai.rtk is asked, briefly, whether winget
+// has rtk installed at all.
+func askWingetOwns(bin, real string) bool {
+	if locs, ok := wingetRecords(); ok && len(locs) > 0 {
+		for _, l := range locs {
+			if inFolder(real, l) || inFolder(bin, l) {
+				return true
+			}
+		}
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), wingetListTimeout)
+	defer cancel()
+	cmd := proc.CommandContext(ctx, "winget", "list", "--id", "rtk-ai.rtk", "--exact", "--accept-source-agreements", "--disable-interactivity")
+	cmd.Stdin = nil
+	out, err := cmd.Output()
+	// it lists the package by its id in any language, and says it has none
+	// with exit code 0x8A150014
+	return err == nil && strings.Contains(string(out), "rtk-ai.rtk")
+}
+
+// wingetListTimeout is how long winget list is given; a var for tests.
+var wingetListTimeout = 15 * time.Second
+
+// inFolder says whether path is folder dir or inside it, case aside, as
+// Windows has paths.
+func inFolder(path, dir string) bool {
+	if dir == "" {
+		return false
+	}
+	p, d := strings.ToLower(filepath.Clean(path)), strings.ToLower(filepath.Clean(dir))
+	return p == d || strings.HasPrefix(p, strings.TrimRight(d, `\/`)+string(filepath.Separator))
 }
 
 // UpgradeRTK brings rtk up to its latest release the way it was installed.
@@ -165,7 +386,7 @@ func UpgradeRTK() (*RTKView, error) {
 	if bin == "" {
 		return nil, fmt.Errorf("rtk isn't installed — install it first (%s)", RTKURL)
 	}
-	c := rtkUpgrader(bin)
+	c := upgraderOf(bin)
 	if c == nil {
 		return nil, fmt.Errorf("magpie can't tell how the rtk at %s was installed — update it the way you installed it", bin)
 	}
@@ -182,13 +403,15 @@ func UpgradeRTK() (*RTKView, error) {
 	// brew upgrade updates Homebrew first, for its newest rtk
 	// winget having no newer rtk than this one yet is no failure
 	none := false
-	if _, err := runInstaller(c, timeout, env...); err != nil {
+	if _, err := runRTKInstaller(c, timeout, rtkAdminFolder(c, bin), env...); err != nil {
 		var ie *installError
 		if none = errors.As(err, &ie) && c[0] == "winget" && uint32(ie.code) == wingetNoUpgrade; !none {
 			return nil, err
 		}
 	}
 	v := ReadRTK()
+	// the package manager just installed the newest it has
+	rtkChannelHas(c, v.Version)
 	v.CheckLatest()
 	if v.Latest != "" && newer(v.Latest, v.Version) {
 		switch {
@@ -247,20 +470,21 @@ func (e *installError) Error() string { return e.msg }
 const wingetNoUpgrade uint32 = 0x8A15002B // APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE
 
 var wingetSays = map[uint32]string{
-	wingetNoUpgrade: "winget has no newer RTK than this one yet",
-	0x8A150014:      "winget finds no rtk-ai.rtk package",
-	0x8A150050:      "winget can't tell which version of RTK is installed, so it won't upgrade it",
-	0x8A150101:      "RTK is in use — close the agents running it and try again",
-	0x8A150111:      "RTK is in use — close the agents running it and try again",
-	0x8A150052:      "winget couldn't put the new rtk.exe in place — if an agent is running rtk, close it and try again",
-	0x8A150107:      "winget couldn't reach the network",
-	0x8A150008:      "winget couldn't download RTK",
-	0x8A150011:      "the download didn't match winget's checksum",
-	0x8A150045:      "winget couldn't open its package source",
-	0x8A150046:      "winget's source agreements weren't accepted",
-	0x8A15003A:      "a policy on this machine blocks winget",
-	0x8A15010F:      "a policy on this machine blocks the install",
-	0x8A15010C:      "the install was cancelled",
+	wingetNoUpgrade:  "winget has no newer RTK than this one yet",
+	0x8A150014:       "winget finds no rtk-ai.rtk package",
+	wingetNeedsAdmin: "winget needs an administrator for this RTK, installed for every user of this computer",
+	0x8A150050:       "winget can't tell which version of RTK is installed, so it won't upgrade it",
+	0x8A150101:       "RTK is in use — close the agents running it and try again",
+	0x8A150111:       "RTK is in use — close the agents running it and try again",
+	0x8A150052:       "winget couldn't put the new rtk.exe in place — if an agent is running rtk, close it and try again",
+	0x8A150107:       "winget couldn't reach the network",
+	0x8A150008:       "winget couldn't download RTK",
+	0x8A150011:       "the download didn't match winget's checksum",
+	0x8A150045:       "winget couldn't open its package source",
+	0x8A150046:       "winget's source agreements weren't accepted",
+	0x8A15003A:       "a policy on this machine blocks winget",
+	0x8A15010F:       "a policy on this machine blocks the install",
+	0x8A15010C:       "the install was cancelled",
 }
 
 // exitCode is a process's exit code as its platform writes it: a Windows

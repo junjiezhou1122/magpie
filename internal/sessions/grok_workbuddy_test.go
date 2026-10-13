@@ -38,10 +38,12 @@ func TestGrok(t *testing.T) {
 	if !g.Start.Equal(at("2026-09-27T08:00:00Z")) || !g.Last.Equal(at("2026-09-27T08:02:10Z")) {
 		t.Fatalf("grok times %s %s", g.Start, g.Last)
 	}
-	if runtime.GOOS != "windows" {
-		if want := "cd '/work/grok' && grok --resume " + grokMain; g.Resume != want {
-			t.Fatalf("resume %q", g.Resume)
-		}
+	want := "cd '/work/grok' && grok --resume " + grokMain
+	if runtime.GOOS == "windows" {
+		want = "Set-Location -LiteralPath '/work/grok'; grok --resume " + grokMain
+	}
+	if g.Resume != want {
+		t.Fatalf("resume %q", g.Resume)
 	}
 	// the fork: what it copied counted in the session it came from
 	f := find(t, ss, "grok", grokFork)
@@ -77,26 +79,30 @@ func TestWorkBuddy(t *testing.T) {
 	inZone(t, 0)
 	home := setupAgents(t)
 	ss := List(0)
-	if n := count(ss, "workbuddy"); n != 2 {
-		t.Fatalf("want 2 WorkBuddy sessions, got %d", n)
+	// the launch session, the one whose calls went through magpie's gateway,
+	// and the one brought over from the older history
+	if n := count(ss, "workbuddy"); n != 3 {
+		t.Fatalf("want 3 WorkBuddy sessions, got %d", n)
 	}
 	w := find(t, ss, "workbuddy", wbID)
 	if w.Cwd != "/work/wb" || w.Title != "Launch notes draft" || w.Resume != "" {
 		t.Fatalf("workbuddy: %+v", w)
 	}
-	// a reply's usage counted once, however many of its lines carry it
-	if m := model(w, "hy3"); m.Tokens != (Tokens{400, 120, 2200, 0, 0}) {
+	// a reply's usage counted once, however many of its lines carry it: the
+	// last line's is the reply's own total, here m2's (9999 − 7777 cached)
+	if m := model(w, "hy3"); m.Tokens != (Tokens{2422, 968, 8777, 0, 0}) {
 		t.Fatalf("hy3: %+v", m)
 	}
 	if !w.Start.Equal(at("2026-09-27T10:00:00Z")) || !w.Last.Equal(at("2026-09-27T10:00:10Z")) {
 		t.Fatalf("workbuddy times %s %s", w.Start, w.Last)
 	}
-	// brought over from its older history: the cwd in its meta file
+	// brought over from its older history: the cwd in its meta file, and
+	// each of its three replies counted once — they name no messageId
 	o := find(t, ss, "workbuddy", wbOldID)
 	if o.Cwd != "/work/wb-old" || o.Title != "Quarterly report" {
 		t.Fatalf("old: %+v", o)
 	}
-	if m := model(o, "auto"); m.Tokens != (Tokens{5000, 100, 0, 0, 0}) {
+	if m := model(o, "auto"); m.Tokens != (Tokens{5500, 130, 0, 0, 0}) {
 		t.Fatalf("auto: %+v", m)
 	}
 

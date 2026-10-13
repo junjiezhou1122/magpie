@@ -40,7 +40,7 @@ type Listing struct {
 	Providers []string          `json:"providers,omitempty"` // OpenCode's ids of those it signs in to
 	Community bool              `json:"community,omitempty"` // written by magpie's community
 	Replaces  string            `json:"replaces,omitempty"`  // the built-in subscription it does the work of
-	Kind      string            `json:"kind,omitempty"`      // "middleware" for gateway middleware; none for a provider
+	Kind      string            `json:"kind,omitempty"`      // "middleware" for gateway middleware, "agent" for an agent; none for a provider
 	Summary   map[string]string `json:"summary,omitempty"`   // by language: en, zh
 }
 
@@ -57,6 +57,24 @@ type NPM struct {
 	Homepage    string `json:"homepage,omitempty"`
 	Repository  string `json:"repository,omitempty"`
 	Weekly      int    `json:"weekly"` // downloads last week
+	// Icon is the picture the package gives in package.json's
+	// magpie.icon, as npm has it: magpie checks and keeps it before the
+	// page shows it, as a GitHub-tagged plugin's (the GUI's listings)
+	Icon string `json:"icon,omitempty"`
+}
+
+// ownIcon is a picture a package.json's magpie.icon gives, as host.js's
+// iconOf takes one: an https URL or a data:image URI, not too big; ""
+// for anything else.
+func ownIcon(said string) string {
+	ic := strings.TrimSpace(said)
+	if len(ic) > 3<<19 {
+		return ""
+	}
+	if l := strings.ToLower(ic); strings.HasPrefix(l, "https://") || strings.HasPrefix(l, "data:image/") {
+		return ic
+	}
+	return ""
 }
 
 var (
@@ -322,9 +340,15 @@ type npmLatest struct {
 	Homepage    string `json:"homepage"`
 	Repository  any    `json:"repository"`
 	Author      any    `json:"author"`
-	NPMUser     struct {
+	// Main and Exports are what importing it loads (pkgEntry)
+	Main    string          `json:"main"`
+	Exports json.RawMessage `json:"exports"`
+	NPMUser struct {
 		Name string `json:"name"`
 	} `json:"_npmUser"`
+	Magpie struct {
+		Icon string `json:"icon"`
+	} `json:"magpie"`
 }
 
 func person(v any) string {
@@ -393,6 +417,7 @@ func npmAsk(ctx context.Context, name string) (NPM, error) {
 		info.License, _ = l.License.(string)
 		info.Repository = repoURL(l.Repository)
 		info.Publisher = person(l.Author)
+		info.Icon = ownIcon(l.Magpie.Icon)
 		if info.Publisher == "" {
 			info.Publisher = l.NPMUser.Name
 		}
@@ -525,6 +550,15 @@ type Page struct {
 // from a folder on this computer or a git repository — the one its folder
 // carries.
 func Readme(ctx context.Context, name string) (Page, error) {
+	if IsGit(name) {
+		// one not installed yet (a repository tagged magpie-plugin): its
+		// README as GitHub has it
+		if _, err := os.Stat(Target(name)); err != nil {
+			if repo := githubRepo(name); repo != "" {
+				return githubReadme(ctx, repo)
+			}
+		}
+	}
 	if IsPath(name) || IsGit(name) {
 		return folderReadme(Target(name))
 	}
@@ -602,8 +636,28 @@ func Installed(spec string) string {
 	return p.Version
 }
 
+// InstalledIcon is the picture the installed plugin spec's package.json
+// gives in magpie.icon, as ownIcon takes one: the plugin's own, for its
+// row, apart from those its providers give themselves in the auth hook
+// (#1775). "" for none, or a plugin that is one file.
+func InstalledIcon(spec string) string {
+	b, err := os.ReadFile(filepath.Join(Target(spec), "package.json"))
+	if err != nil {
+		return ""
+	}
+	var p struct {
+		Magpie struct {
+			Icon string `json:"icon"`
+		} `json:"magpie"`
+	}
+	if json.Unmarshal(b, &p) != nil {
+		return ""
+	}
+	return ownIcon(p.Magpie.Icon)
+}
+
 // Upgrade installs the newest version of one plugin: npm's, or its git
-// repository's commit now.
+// repository's commit now. One bun won't install says why.
 func Upgrade(ctx context.Context, name string) error {
 	for _, e := range Load().Plugins {
 		if (Name(e.Spec) == name || e.Spec == name) && IsGit(e.Spec) {
@@ -612,7 +666,9 @@ func Upgrade(ctx context.Context, name string) error {
 			return err
 		}
 		if Name(e.Spec) == name && !IsPath(e.Spec) {
-			_, err := Add(ctx, name)
+			// the version npm has now, not bun's "latest" (installAt);
+			// npm not answering, bun's as before
+			_, err := add(ctx, name, newestOf(ctx, name))
 			return err
 		}
 	}

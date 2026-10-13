@@ -56,17 +56,56 @@ func trayProps(tray *application.SystemTray) (props *prop.Properties) {
 	if tray == nil {
 		return nil
 	}
-	impl := reflect.ValueOf(tray).Elem().FieldByName("impl")
-	if !impl.IsValid() || impl.Kind() != reflect.Interface || impl.IsNil() {
+	impl := trayImpl(reflect.ValueOf(tray).Elem())
+	if !impl.IsValid() {
 		return nil
 	}
-	p := impl.Elem()
-	if p.Kind() != reflect.Pointer || p.IsNil() || p.Elem().Kind() != reflect.Struct {
-		return nil
-	}
-	f := p.Elem().FieldByName("props")
+	f := impl.FieldByName("props")
 	if !f.IsValid() || f.Type() != reflect.TypeOf((*prop.Properties)(nil)) {
 		return nil
 	}
 	return *(**prop.Properties)(unsafe.Pointer(f.UnsafeAddr()))
+}
+
+// trayClick is where the tray host said the icon was clicked, across its
+// bar: Wails' Linux tray keeps Activate(x, y)'s coordinates
+// (SystemTray.impl.lastClickX) and passes the click handler none. ok is
+// false when they aren't there to read.
+func trayClick(tray *application.SystemTray) (x int, ok bool) {
+	if tray == nil {
+		return 0, false
+	}
+	return clickIn(reflect.ValueOf(tray).Elem())
+}
+
+// setTrayPassive takes the tray's StatusNotifierItem out of the bar's tray
+// (Status "Passive") while magpie's icon is in Omarchy's bar as its widget,
+// and puts it back ("Active") when it isn't. Omarchy's tray and waybar's both
+// leave a Passive item out. Wails exports Status read-only and has no Hide
+// on Linux, so it is set through Wails' own properties, as the tooltip is,
+// and NewStatus is sent for the hosts that read it again only on that.
+func setTrayPassive(tray *application.SystemTray, passive bool) (ok bool) {
+	props := trayProps(tray)
+	if props == nil {
+		return false
+	}
+	status := "Active"
+	if passive {
+		status = "Passive"
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			log.Println("tray: status:", r)
+			ok = false
+		}
+	}()
+	props.SetMust("org.kde.StatusNotifierItem", "Status", status)
+	conn, err := dbus.SessionBus() // the connection Wails' tray is on
+	if err != nil {
+		return false
+	}
+	if err := conn.Emit("/StatusNotifierItem", "org.kde.StatusNotifierItem.NewStatus", status); err != nil {
+		log.Println("tray: status signal:", err)
+	}
+	return true
 }

@@ -371,7 +371,7 @@ func wbProvider(a wbAccount) Provider {
 		return nil
 	}
 	acct.explain = wbExplain
-	acct.models = func() []catalog.Model { return w.models }
+	acct.models = func() []catalog.Model { return w.textOnly(w.models) }
 	acct.fetch = func(ctx context.Context) ([]catalog.Model, error) {
 		ms, err := wbFetchModels(ctx, w, acct.sign)
 		if err != nil {
@@ -452,10 +452,62 @@ const WBRefusedHint = "WorkBuddy refuses chats from Codex and Claude Code (their
 // wbRefused matches that refusal in what WorkBuddy answered.
 var wbRefused = regexp.MustCompile(`(?i)unapproved channel|illegal api invocation`)
 
-// wbExplain adds WBRefusedHint to WorkBuddy's refusal of the client.
+// WBRestrictedHint is what magpie adds to WorkBuddy's 403 code 11140
+// "request illegal" (#1849), whose displayMsg says "Your account has been
+// restricted due to unusual activity": the account, not the request, is
+// out until WorkBuddy lifts the restriction, which its appeal asks for.
+// The gateway reads it as the account restricted (failRestricted), the
+// plugin adds the same words, and the Routing page says it apart.
+const WBRestrictedHint = "WorkBuddy restricted this account for unusual activity; it stays out until WorkBuddy lifts that, which an appeal (Submit feedback in WorkBuddy) asks for"
+
+// wbRestrictedWords are the restriction as WorkBuddy's 11140 words it in
+// its displayMsg and displayTips: English, Simplified and Traditional
+// Chinese.
+var wbRestrictedWords = regexp.MustCompile(`(?i)account has been restricted due to unusual activity|账号存在异常行为|帳號存在異常行為`)
+
+// wbRestrictedCode is WorkBuddy's code for an account it restricted.
+const wbRestrictedCode = 11140
+
+// WBRestricted says body is WorkBuddy's refusal of a restricted account:
+// its code 11140 (top level, or under data or error, as a number or a
+// string), or its displayMsg's words. Only for a WorkBuddy answer: another
+// vendor's 11140 is its own.
+func WBRestricted(status int, body []byte) bool {
+	if status < 400 {
+		return false
+	}
+	var v map[string]any
+	if json.Unmarshal(body, &v) == nil {
+		codes := []any{v["code"]}
+		for _, k := range []string{"data", "error"} {
+			if in, ok := v[k].(map[string]any); ok {
+				codes = append(codes, in["code"])
+			}
+		}
+		for _, c := range codes {
+			switch c := c.(type) {
+			case float64:
+				if c == wbRestrictedCode {
+					return true
+				}
+			case string:
+				if c == strconv.Itoa(wbRestrictedCode) {
+					return true
+				}
+			}
+		}
+	}
+	return wbRestrictedWords.Match(body)
+}
+
+// wbExplain adds WBRefusedHint to WorkBuddy's refusal of the client, and
+// WBRestrictedHint to its refusal of a restricted account.
 func wbExplain(status int, body []byte) string {
 	if status >= 400 && wbRefused.Match(body) {
 		return WBRefusedHint
+	}
+	if WBRestricted(status, body) {
+		return WBRestrictedHint
 	}
 	return ""
 }
@@ -773,7 +825,7 @@ func wbCallVia(ctx context.Context, do func(*http.Request) (*http.Response, erro
 // app asks for a state and a page, opens the page for the user to sign in,
 // then polls for the token and the account.
 func startWorkBuddySignIn(s *signInFlow, w *wbSite) error {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(s.via(context.Background()))
 	var state struct {
 		State   string `json:"state"`
 		AuthURL string `json:"authUrl"`
@@ -867,6 +919,13 @@ func wbKeepSignIn(w *wbSite, c wbCreds, name string) (who string, again, using b
 		return "", false, false, err
 	}
 	using = hasOwn && own.UID == c.UID
+	// its kept usage reading was read under the old sign-in (as
+	// addSideLogin drops it), once loginsMu is let go
+	defer func() {
+		if err == nil {
+			StaleAllowance(w.id, who)
+		}
+	}()
 	loginsMu.Lock()
 	defer loginsMu.Unlock()
 	ls := readLogins()

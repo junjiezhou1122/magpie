@@ -15,11 +15,15 @@ import (
 // first shown while another app was full screen (a restart to update, with
 // the user in that app) belonged to that app's Space from then on, and every
 // Open went back to it. It moves to the Space the user is on whenever it is
-// shown instead, and can still be made full screen itself.
+// shown instead, and can still be made full screen itself. Once shown it
+// stays on its Space (showHere), so a click on the Dock icon goes to it there
+// (reopenMain).
 func mainMacWindow() application.MacWindow {
 	return application.MacWindow{
 		// no InvisibleTitleBarHeight: that strip drags from anywhere in
-		// it, tabs included; the header marks what drags instead
+		// it, tabs included; the header marks what drags instead. On
+		// macOS 26 and later its toolbar is taken off once it has placed
+		// the traffic lights (plainTitlebar)
 		TitleBar: application.MacTitleBarHiddenInset,
 		CollectionBehavior: application.MacWindowCollectionBehaviorMoveToActiveSpace |
 			application.MacWindowCollectionBehaviorFullScreenPrimary,

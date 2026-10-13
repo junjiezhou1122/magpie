@@ -19,7 +19,9 @@ import (
 	toml "github.com/pelletier/go-toml/v2"
 	"github.com/tidwall/gjson"
 
+	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/settings"
+	"github.com/yetone/magpie/internal/steady"
 )
 
 // Codex lists, in its history and its resume picker, only the sessions made
@@ -98,11 +100,16 @@ type codexConfig struct {
 	} `toml:"profiles"`
 }
 
+// readCodexConfig is the folder's codexConfig, parsed again only when
+// config.toml changes: a config.toml holding a table for each of ten
+// thousand projects took ~0.15s of CPU to parse, on each visit to Sessions
+// (#1665). What it gives is shared and must not be changed.
 func readCodexConfig(home string) codexConfig {
-	var c codexConfig
-	if b, err := os.ReadFile(filepath.Join(home, "config.toml")); err == nil {
+	c, _ := filememo.Read("sessions codex config", filepath.Join(home, "config.toml"), func(b []byte) (codexConfig, error) {
+		var c codexConfig
 		toml.Unmarshal(b, &c)
-	}
+		return c, nil
+	})
 	return c
 }
 
@@ -301,6 +308,38 @@ func MoveCodexProvider(id, to string) (CodexMove, error) {
 	return mv, nil
 }
 
+// CodexThreadProviders is every provider the threads of a Codex folder
+// were started on, as its state databases keep them: the Codex app resumes
+// a thread on that one, whatever config.toml's model_provider is now, and
+// fails to load its config for it when config.toml has no table of that
+// id (#1372). A database without the threads table, or one that can't be
+// read, says nothing.
+func CodexThreadProviders(home string) []string {
+	var out []string
+	for _, p := range codexStateDBs(home) {
+		u := url.URL{Scheme: "file", Path: filepath.ToSlash(p), RawQuery: "mode=ro&_pragma=busy_timeout(2000)"}
+		if len(u.Path) >= 2 && u.Path[1] == ':' {
+			u.Path = "/" + u.Path
+		}
+		db, err := sql.Open("sqlite", u.String())
+		if err != nil {
+			continue
+		}
+		rows, err := db.Query(`SELECT DISTINCT model_provider FROM threads`)
+		if err == nil {
+			for rows.Next() {
+				var s sql.NullString
+				if rows.Scan(&s) == nil && codexProviderRe.MatchString(s.String) && !contains(out, s.String) {
+					out = append(out, s.String)
+				}
+			}
+			rows.Close()
+		}
+		db.Close()
+	}
+	return out
+}
+
 func contains(list []string, s string) bool {
 	for _, x := range list {
 		if x == s {
@@ -416,6 +455,11 @@ func rewriteCodexProvider(path, to string) (bool, error) {
 		}
 	}
 	if err := tmp.Chmod(fi.Mode().Perm()); err != nil {
+		return false, err
+	}
+	// the user's session on the disk before it is renamed over the old
+	// one: a machine that goes down between can leave it all zero (#1505)
+	if err := steady.Sync(tmp); err != nil {
 		return false, err
 	}
 	if err := tmp.Close(); err != nil {

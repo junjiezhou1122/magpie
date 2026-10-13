@@ -2,6 +2,7 @@ package backup
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"os"
@@ -68,9 +69,9 @@ func setUp(t *testing.T) {
 	}
 	for _, p := range []provider.Provider{
 		{ID: "acme", Name: "Acme", Chat: "https://acme.example.com/v1", Key: "sk-acme", Icon: icon,
-			BalanceToken: "balance-acme",
-			Keys:         []provider.KeyAccount{{Name: "second", Key: "sk-acme-2"}},
-			Headers:      map[string]string{"X-Team": "a", "X-Api-Key": "hdr-secret"}},
+			BalanceToken: "balance-acme", AccessKeyID: "AK-acme", SecretAccessKey: "SK-acme",
+			Keys:    []provider.KeyAccount{{Name: "second", Key: "sk-acme-2"}},
+			Headers: map[string]string{"X-Team": "a", "X-Api-Key": "hdr-secret"}},
 		{ID: "beta", Name: "Beta", Chat: "https://beta.example.com/v1", Key: "sk-beta", BalanceToken: "balance-beta"},
 	} {
 		if err := provider.Save(p); err != nil {
@@ -96,7 +97,7 @@ func TestRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, secret := range []string{"sk-acme", "balance-acme", "hdr-secret", "acme.example.com", "work"} {
+	for _, secret := range []string{"sk-acme", "balance-acme", "SK-acme", "hdr-secret", "acme.example.com", "work"} {
 		if strings.Contains(string(data), secret) {
 			t.Fatalf("%q readable in the file", secret)
 		}
@@ -118,7 +119,8 @@ func TestRoundTrip(t *testing.T) {
 		t.Fatalf("result: %+v", r)
 	}
 	p, err := provider.Find("acme")
-	if err != nil || p.Key != "sk-acme" || len(p.Keys) != 1 || p.BalanceToken != "balance-acme" || p.Headers["X-Api-Key"] != "hdr-secret" {
+	if err != nil || p.Key != "sk-acme" || len(p.Keys) != 1 || p.BalanceToken != "balance-acme" || p.Headers["X-Api-Key"] != "hdr-secret" ||
+		p.AccessKeyID != "AK-acme" || p.SecretAccessKey != "SK-acme" {
 		t.Fatalf("acme: %+v %v", p, err)
 	}
 	name, _ := strings.CutPrefix(p.Icon, "file:")
@@ -143,7 +145,7 @@ func TestNoKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, p := range b.Providers {
-		if p.Key != "" || len(p.Keys) != 0 || p.BalanceToken != "" {
+		if p.Key != "" || len(p.Keys) != 0 || p.BalanceToken != "" || p.AccessKeyID != "" || p.SecretAccessKey != "" {
 			t.Fatalf("key in a keyless backup: %+v", p)
 		}
 		if _, ok := p.Headers["X-Api-Key"]; ok {
@@ -159,7 +161,8 @@ func TestNoKeys(t *testing.T) {
 	}
 
 	home(t)
-	if err := provider.Save(provider.Provider{ID: "acme", Name: "Acme old", Chat: "https://old.example.com/v1", Key: "sk-here", BalanceToken: "balance-here"}); err != nil {
+	if err := provider.Save(provider.Provider{ID: "acme", Name: "Acme old", Chat: "https://old.example.com/v1", Key: "sk-here", BalanceToken: "balance-here",
+		AccessKeyID: "AK-here", SecretAccessKey: "SK-here"}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := Open(data, "pw")
@@ -173,7 +176,7 @@ func TestNoKeys(t *testing.T) {
 	if r.Added != 1 || r.Replaced != 1 || !slices.Equal(r.NeedKey, []string{"Beta"}) || r.Settings || r.Profiles != 0 {
 		t.Fatalf("result: %+v", r)
 	}
-	if p, _ := provider.Find("acme"); p.Key != "sk-here" || p.BalanceToken != "balance-here" || p.Chat != "https://acme.example.com/v1" || p.Headers["X-Team"] != "a" {
+	if p, _ := provider.Find("acme"); p.Key != "sk-here" || p.BalanceToken != "balance-here" || p.AccessKeyID != "AK-here" || p.SecretAccessKey != "SK-here" || p.Chat != "https://acme.example.com/v1" || p.Headers["X-Team"] != "a" {
 		t.Fatalf("acme: %+v", p)
 	}
 	if p, _ := provider.Find("beta"); p.BalanceToken != "" {
@@ -396,5 +399,34 @@ func TestProfileKeys(t *testing.T) {
 	want := []string{"codex.provider", "claude.model", "codex.model", "codex.effort"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("%v", got)
+	}
+}
+
+// A sync seals a backup every round and opens the one on the server: the
+// key is derived once a run, not once a backup, PBKDF2 being slow on
+// purpose (davsync's tests ran past go test's 10 minutes under -race).
+func TestSealDerivesOnce(t *testing.T) {
+	pass := rand.Text() // one no earlier run derived a key for
+	keysMu.Lock()
+	before := len(keys)
+	keysMu.Unlock()
+	var sealed [][]byte
+	for range 2 {
+		data, err := Seal(Bundle{Version: 1}, pass)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sealed = append(sealed, data)
+	}
+	for _, data := range sealed {
+		if _, err := Open(data, pass); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keysMu.Lock()
+	derivedNow := len(keys) - before
+	keysMu.Unlock()
+	if derivedNow != 1 {
+		t.Fatalf("derived %d keys for two backups under one passphrase, want 1", derivedNow)
 	}
 }

@@ -33,6 +33,8 @@ func TestPlanQuotaSource(t *testing.T) {
 		{Provider{Chat: "https://api.minimaxi.com/v1", Anthropic: "https://api.minimaxi.com/anthropic"}, "https://api.minimaxi.com/v1/token_plan/remains", true, false},
 		{Provider{Anthropic: "https://api.minimax.io/anthropic"}, "https://api.minimax.io/v1/token_plan/remains", true, false},
 		{Provider{Chat: "https://api.deepseek.com"}, "", false, false},
+		{Provider{Chat: "https://ollama.com/v1", Anthropic: "https://ollama.com"}, "https://ollama.com/api/balance", true, false},
+		{Provider{Chat: "http://localhost:11434/v1"}, "", false, false}, // a local Ollama
 	} {
 		src, ok := planQuotaSourceOf(c.p)
 		if ok != c.ok || src.url != c.url || src.sure != c.sure {
@@ -177,6 +179,58 @@ func TestReadMiniMaxPlan(t *testing.T) {
 	}
 }
 
+// A Token Plan's video bucket is counted in videos, and MiniMax's CLI
+// shows it so, "4 / 5" left of the day and "34 / 35" of the week (#1366,
+// the reporter's mmx quota show): the window carries the count, used of
+// total, whichever way usage_count is told, and the general bucket,
+// counted in no items, carries none.
+func TestReadMiniMaxPlanVideoCounts(t *testing.T) {
+	h := int64(3600 * 1000)
+	_, ws, err := readMiniMaxPlan([]byte(`{"model_remains":[
+		{"model_name":"general","start_time":1791100800000,"end_time":` + jsonInt(1791100800000+5*h) + `,"remains_time":120000,
+		 "current_interval_total_count":0,"current_interval_usage_count":0,"current_interval_remaining_percent":94,"current_interval_status":1,
+		 "weekly_start_time":1791043200000,"weekly_end_time":` + jsonInt(1791043200000+168*h) + `,"weekly_remains_time":259200000,
+		 "current_weekly_total_count":0,"current_weekly_usage_count":0,"current_weekly_remaining_percent":93,"current_weekly_status":1},
+		{"model_name":"video","start_time":1791043200000,"end_time":` + jsonInt(1791043200000+24*h) + `,"remains_time":50520000,
+		 "current_interval_total_count":5,"current_interval_usage_count":1,"current_interval_remaining_percent":80,"current_interval_status":1,
+		 "weekly_start_time":1791043200000,"weekly_end_time":` + jsonInt(1791043200000+168*h) + `,"weekly_remains_time":259200000,
+		 "current_weekly_total_count":35,"current_weekly_usage_count":34,"current_weekly_remaining_percent":97.14,"current_weekly_status":1}],
+		"base_resp":{"status_code":0,"status_msg":"success"}}`))
+	if err != nil || len(ws) != 4 {
+		t.Fatalf("%v %+v", err, ws)
+	}
+	for _, w := range ws[:2] {
+		if w.Limit != 0 || w.Unit != "" {
+			t.Errorf("general, counted in no items, has a count: %+v", w)
+		}
+	}
+	// the day's usage_count (1) is what is used, the week's (34) what remains
+	if w := ws[2]; w.Name != "Video · 24 hours" || w.Amount != 1 || w.Limit != 5 || w.Unit != "videos" || w.Count(true) != "4 / 5 videos" || math.Abs(w.Used-20) > 1e-9 {
+		t.Errorf("video, the day: %+v", w)
+	}
+	if w := ws[3]; w.Name != "Video · 7 days" || w.Amount != 1 || w.Limit != 35 || w.Unit != "videos" || w.Count(true) != "34 / 35 videos" || w.Count(false) != "1 / 35 videos" {
+		t.Errorf("video, the week: %+v", w)
+	}
+
+	// a count the percentage doesn't agree with is no count; a used-up
+	// window is all of it used
+	_, ws, err = readMiniMaxPlan([]byte(`{"model_remains":[{"model_name":"video",
+		"start_time":1791043200000,"end_time":` + jsonInt(1791043200000+24*h) + `,
+		"current_interval_total_count":5,"current_interval_usage_count":2,"current_interval_remaining_percent":50,"current_interval_status":1,
+		"weekly_start_time":1791043200000,"weekly_end_time":` + jsonInt(1791043200000+168*h) + `,
+		"current_weekly_total_count":35,"current_weekly_usage_count":0,"current_weekly_remaining_percent":0,"current_weekly_status":2}],
+		"base_resp":{"status_code":0}}`))
+	if err != nil || len(ws) != 2 {
+		t.Fatalf("%v %+v", err, ws)
+	}
+	if w := ws[0]; w.Limit != 0 || w.Count(false) != "" || w.Used != 50 {
+		t.Errorf("a count against the percentage: %+v", w)
+	}
+	if w := ws[1]; w.Amount != 35 || w.Limit != 35 || w.Used != 100 {
+		t.Errorf("used up: %+v", w)
+	}
+}
+
 func jsonInt(n int64) string { b, _ := json.Marshal(n); return string(b) }
 
 func TestPlanWindowsAuth(t *testing.T) {
@@ -251,6 +305,13 @@ func TestPlanQuotas(t *testing.T) {
 			w.Write([]byte(`{"code":200,"success":true,"data":[{"productName":"GLM Coding Pro","status":"VALID","autoRenew":1,"nextRenewTime":"2026-10-18 10:00:00"}]}`))
 		case "open.bigmodel.cn/api/biz/subscription/list glm-b":
 			w.WriteHeader(http.StatusInternalServerError)
+		case "open.bigmodel.cn/api/biz/customer-package-reset/list glm-a":
+			if r.URL.Query().Get("targetType") != "PERSONAL" {
+				t.Errorf("resets asked as %s", r.URL)
+			}
+			w.Write([]byte(zhipuResetList))
+		case "open.bigmodel.cn/api/biz/customer-package-reset/list glm-b":
+			w.Write([]byte(`{"code":1000,"msg":"身份验证失败。","success":false}`))
 		case "api.minimaxi.com/v1/token_plan/remains Bearer sk-cp-k":
 			w.Write([]byte(`{"model_remains":[{"model_name":"general","current_interval_remaining_percent":75,"current_interval_status":1,
 				"current_weekly_remaining_percent":96,"current_weekly_status":1}],"base_resp":{"status_code":0,"status_msg":"success"}}`))
@@ -298,6 +359,13 @@ func TestPlanQuotas(t *testing.T) {
 	}
 	if q := got["glm/home"]; q.Plan != "lite" || q.Windows[0].Used != 90 || q.Until != nil || q.Error != "" {
 		t.Errorf("second key: %+v", q)
+	}
+	// its resets (#1191): a list read is counted, one refused shows none
+	if r := got["glm/work"].Resets; r == nil || r.Count != 2 || r.FiveHour != 1 || r.Weekly != 1 {
+		t.Errorf("first key's resets: %+v", r)
+	}
+	if r := got["glm/home"].Resets; r != nil {
+		t.Errorf("second key's resets: %+v", r)
 	}
 	if q := got["go/"]; q.Name != "OpenCode Go" || len(q.Windows) != 1 || q.Windows[0].Name != "5 hours" {
 		t.Errorf("go: %+v", q)
@@ -347,5 +415,52 @@ func TestReadKimiCode(t *testing.T) {
 	}
 	if _, _, err := readKimiCode([]byte(`{"error":{"message":"bad key"}}`)); err == nil {
 		t.Fatal("nothing read")
+	}
+}
+
+// An OpenCode Go key whose windows can't be read says why, with the way
+// out (sakulalalalalal on X: three Go keys, each "Allowance unavailable"
+// and nothing more). The bodies are OpenCode's own, as zen/go/v1/usage
+// answered on 2026-10-10: a key whose member has no Go, and a key it
+// doesn't know.
+func TestOpenCodeGoSaysWhyNoWindows(t *testing.T) {
+	bodies := map[string]struct {
+		status int
+		body   string
+	}{
+		"/nogo":    {http.StatusForbidden, `{"type":"error","error":{"type":"EntitlementError","message":"OpenCode Go subscription required."}}`},
+		"/unknown": {http.StatusUnauthorized, `{"type":"error","error":{"type":"AuthError","message":"Unauthorized"}}`},
+		"/down":    {http.StatusServiceUnavailable, `{"error":{"type":"api_error","message":"Inference routing is unavailable. Please retry later."}}`},
+		"/other":   {http.StatusOK, `{"usage":{"fiveHour":{"used":3}},"plan":"go"}`},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b := bodies[r.URL.Path]
+		w.WriteHeader(b.status)
+		w.Write([]byte(b.body))
+	}))
+	defer srv.Close()
+	read := func(path string) string {
+		// the vendor's host, so the OpenCode rules apply
+		_, _, err := planWindows(context.Background(), planQuotaSource{url: srv.URL + path + "?opencode.ai", bearer: true, read: readOpenCodeGo}, "k")
+		if err == nil {
+			t.Fatalf("%s read as windows", path)
+		}
+		return err.Error()
+	}
+	for path, want := range map[string][]string{
+		"/nogo":    {"no OpenCode Go subscription", "member who subscribed"},
+		"/unknown": {"OpenCode didn't take this key", "401 Unauthorized: Unauthorized"},
+		"/down":    {"503 Service Unavailable", "Inference routing is unavailable"},
+		"/other":   {"no rolling, weekly or monthly window", "usage.fiveHour", "plan"},
+	} {
+		got := read(path)
+		for _, w := range want {
+			if !strings.Contains(got, w) {
+				t.Errorf("%s: %q doesn't say %q", path, got, w)
+			}
+		}
+	}
+	if got := read("/other"); strings.Contains(got, "3") || strings.Contains(got, "go\"") {
+		t.Errorf("an unread reply's values are kept out of the error: %q", got)
 	}
 }

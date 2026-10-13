@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/provider"
 )
 
@@ -24,7 +25,7 @@ func reseatHome(t *testing.T) string {
 		}
 	}
 	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
-	os.MkdirAll(filepath.Join(home, ".hermes"), 0o755)
+	os.MkdirAll(appdir.HermesHomeIn(home), 0o755)
 	return home
 }
 
@@ -94,7 +95,7 @@ func TestReseatOff(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]string{"model": "ds/gpt-5", "opus": "ds/claude-sonnet-4-5-20250929",
-		"haiku": "", "sonnet": "", "fable": ""} // haiku follows the main model; sonnet was ds/gpt-5 already
+		"haiku": "", "sonnet": "ds/gpt-5", "fable": ""} // haiku follows the main model; sonnet keeps the ds/gpt-5 picked for it, now the main model too (#1050)
 	for k, w := range want {
 		if got := c.Field(k).Get(); got != w {
 			t.Errorf("claude %s: %q, want %q", k, got, w)
@@ -172,7 +173,7 @@ func TestReseatUnmovable(t *testing.T) {
 	c, h := mustFind(t, "claude"), mustFind(t, "hermes")
 	mustApply(t, c, "model", "cop/only-here")
 	mustApply(t, h, "model", "magpie/cop/only-here")
-	dir := filepath.Join(home, ".hermes")
+	dir := appdir.HermesHomeIn(home)
 	if err := os.Chmod(dir, 0o555); err != nil {
 		t.Fatal(err)
 	}

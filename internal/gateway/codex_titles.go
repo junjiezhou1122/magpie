@@ -40,6 +40,25 @@ func codexTitlesTo(h http.Header, body []byte, ours bool) string {
 	return ""
 }
 
+// codexDescriptionsTo is where a request Codex makes for a thread's
+// description goes. "" leaves the request as Codex sent it; a model's id
+// writes it. A description is not a title: Codex asks for {"description"}
+// alone, which the title wrapper cannot answer.
+func codexDescriptionsTo(h http.Header, body []byte, ours bool) string {
+	if !isDescriptionKind(requestCallKind(h, requestSessionMetadata(h, body))) {
+		return ""
+	}
+	if to := settings.Load().CodexDescriptions; to != "" {
+		return to
+	}
+	// Codex on a magpie model gets no schema upstream (#743), so an empty
+	// setting still wraps the model it asked for, as titles do.
+	if m := modelOf(body); m != "" && (ours || strings.Contains(m, "/")) {
+		return m
+	}
+	return ""
+}
+
 // titleCheckKey holds, in a request's context, what serve asks of the
 // reply it relayed before it records the call: the reason it fails its
 // caller although the vendor answered, or "".
@@ -108,8 +127,99 @@ func (s *Server) codexTitle(w http.ResponseWriter, r *http.Request, body []byte,
 	if t := titleJSON(messageText(res), shape); t != "" {
 		out = append(out, map[string]any{"type": "message", "id": "msg_" + strings.TrimPrefix(id, "resp_"), "role": "assistant", "status": "completed",
 			"content": []any{map[string]any{"type": "output_text", "text": t, "annotations": []any{}}}})
+	} else if res.Status == "incomplete" {
+		// cut short before any title (max_output_tokens): Codex is told so,
+		// as the vendor told magpie, not that the model finished with
+		// nothing to say (#1466). Codex takes it as a stream error and asks
+		// again, as it does when its own backend answers so.
+		writeTitleEnd(w, id, nil, res.Usage, "incomplete", res.IncompleteDetails)
+		return
 	}
 	writeTitleReply(w, id, out, res.Usage)
+}
+
+// codexDescription answers a thread_description request with the model
+// CodexDescriptions names. The model's text comes back as the
+// {"description": ...} its schema asks for; a reply without one fails as a
+// description, not as a title.
+func (s *Server) codexDescription(w http.ResponseWriter, r *http.Request, body []byte, to string) {
+	body, _ = codexInput(body, true)
+	rec := &recorder{header: http.Header{}, status: 200}
+	check := func(reply string) string {
+		if res, err := compactReply([]byte(reply)); err == nil && descriptionJSON(messageText(res)) == "" {
+			return noDescription(messageText(res))
+		}
+		return ""
+	}
+	ctx := context.WithValue(r.Context(), titleCheckKey{}, check)
+	ctx = magpieChose(ctx)
+	s.serve(rec, r.WithContext(ctx), provider.Responses, withModel(body, to))
+	if rec.status >= 400 {
+		for k, vs := range rec.header {
+			w.Header()[k] = vs
+		}
+		w.WriteHeader(rec.status)
+		w.Write(rec.body.Bytes())
+		return
+	}
+	res, err := compactReply(rec.body.Bytes())
+	if err != nil {
+		writeError(w, provider.Responses, 502, "description: "+err.Error())
+		return
+	}
+	id := res.ID
+	if id == "" {
+		id = fmt.Sprintf("resp_magpie_%d", time.Now().UnixNano())
+	}
+	var out []any
+	if d := descriptionJSON(messageText(res)); d != "" {
+		out = append(out, map[string]any{"type": "message", "id": "msg_" + strings.TrimPrefix(id, "resp_"), "role": "assistant", "status": "completed",
+			"content": []any{map[string]any{"type": "output_text", "text": d, "annotations": []any{}}}})
+	}
+	writeTitleReply(w, id, out, res.Usage)
+}
+
+func noDescription(said string) string {
+	said = strings.Join(strings.Fields(said), " ")
+	if said == "" {
+		return "description: the model answered with no text, so Codex got no description"
+	}
+	if r := []rune(said); len(r) > 80 {
+		said = string(r[:80]) + "…"
+	}
+	return "description: no description in the model's answer, so Codex got none: " + said
+}
+
+// descriptionJSON returns the model's text as the nonempty description
+// object Codex asks for. An unusable answer returns an empty string.
+func descriptionJSON(said string) string {
+	t := strings.TrimSpace(said)
+	if rest, ok := strings.CutPrefix(t, "<think>"); ok {
+		if _, after, ok := strings.Cut(rest, "</think>"); ok {
+			t = strings.TrimSpace(after)
+		}
+	}
+	if strings.HasPrefix(t, "```") {
+		t = strings.TrimPrefix(t, "```")
+		if i := strings.IndexByte(t, '\n'); i >= 0 && !strings.Contains(t[:i], "{") {
+			t = t[i+1:]
+		}
+		t = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(t), "```"))
+	}
+	if strings.HasPrefix(t, "{") {
+		fields := map[string]any{}
+		if json.NewDecoder(bytes.NewReader([]byte(t))).Decode(&fields) == nil {
+			if v, ok := fields["description"].(string); ok {
+				t = v
+			}
+		}
+	}
+	t = strings.TrimSpace(strings.Trim(strings.TrimSpace(t), "\"`'"))
+	if t == "" || strings.HasPrefix(t, "{") {
+		return ""
+	}
+	b, _ := json.Marshal(map[string]string{"description": t})
+	return string(b)
 }
 
 // messageText is the text of a reply's messages, its reasoning left out.
@@ -171,12 +281,25 @@ func (s *Server) codexTitleOff(w http.ResponseWriter, r *http.Request, body []by
 // writeTitleReply streams a finished Responses reply with these output
 // items, as the ChatGPT backend streams one to Codex.
 func writeTitleReply(w http.ResponseWriter, id string, out []any, used json.RawMessage) {
+	writeTitleEnd(w, id, out, used, "completed", nil)
+}
+
+// writeTitleEnd streams a Responses reply that ended so: "completed", or
+// "incomplete" for why in details, the one terminal event
+// response.<status>.
+func writeTitleEnd(w http.ResponseWriter, id string, out []any, used json.RawMessage, status string, details json.RawMessage) {
 	if out == nil {
 		out = []any{}
 	}
-	done := map[string]any{"id": id, "object": "response", "status": "completed", "output": out}
+	done := map[string]any{"id": id, "object": "response", "status": status, "output": out}
 	if len(used) > 0 {
 		done["usage"] = used
+	}
+	if status != "completed" {
+		if len(details) == 0 || string(details) == "null" {
+			details = json.RawMessage(`{"reason":"unknown"}`)
+		}
+		done["incomplete_details"] = details
 	}
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
@@ -187,7 +310,7 @@ func writeTitleReply(w http.ResponseWriter, id string, out []any, used json.RawM
 		evs = append(evs, map[string]any{"type": "response.output_item.added", "output_index": i, "item": it},
 			map[string]any{"type": "response.output_item.done", "output_index": i, "item": it})
 	}
-	evs = append(evs, map[string]any{"type": "response.completed", "response": done})
+	evs = append(evs, map[string]any{"type": "response." + status, "response": done})
 	for _, ev := range evs {
 		b, _ := json.Marshal(ev)
 		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev["type"], b)

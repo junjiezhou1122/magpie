@@ -20,6 +20,9 @@
 .sm-trash-btn.on { background: var(--pill); color: var(--fg); }
 .sm-body { display: flex; flex-direction: column; gap: 8px; flex: none; }
 .sm-note { margin: 0 2px; }
+/* where a session said what was searched for, the words themselves marked */
+.row .sub.sm-hit { color: var(--fg-2); }
+.sm-hit mark { background: var(--accent-soft); color: var(--fg); border-radius: 3px; padding: 0 1px; font-weight: 500; }
 .sm-bar { gap: 8px; padding: 0 11px; }
 .sm-bar .grow { flex: 1; }
 .sm-bar .sm-delete, .sm-bar .sm-empty { display: inline-flex; align-items: center; gap: 5px; }
@@ -31,7 +34,8 @@
 .row.sm-folder { min-height: 34px; gap: 8px; }
 .row.sm-folder .fold { color: var(--fg-2); font-weight: 500; flex: none; max-width: 45%; }
 .row.sm-folder .fold .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.row.sm-folder .sm-path { flex: 0 1 auto; min-width: 0; margin: 0; font-family: var(--code); font-size: 10.5px; color: var(--faint); }
+.row.sm-folder .sm-path { flex: 0 1 auto; min-width: 0; margin: 0; font-family: var(--code-font, var(--code)); font-size: 10.5px; color: var(--faint); }
+:where(html[data-fonts]) .row.sm-folder .sm-path { font-style: var(--code-style, inherit); font-weight: var(--code-weight, inherit); font-stretch: var(--code-stretch, 100%); }
 .row.sm-folder .grow { flex: 1; }
 .row.sm-folder .note { flex: none; font-size: 11px; color: var(--faint); font-variant-numeric: tabular-nums; }
 .row.sm-sess { min-height: 44px; }
@@ -40,13 +44,14 @@
 /* carrying a session on in another agent, and its conversation (#845) */
 .row.sm-sess .sess-carry { height: 24px; color: var(--fg); }
 .pop.proto-menu.sess-carry-menu { width: min(300px, calc(100vw - 16px)); background: var(--card); }
-.sess-talk-btn { height: 22px; padding: 0 8px; font-size: 11.5px; }
+.sess-talk-btn, .sess-export { height: 22px; padding: 0 8px; font-size: 11.5px; }
 .sess-talk { max-height: min(560px, 70vh); overflow-y: auto; margin-top: 4px; padding: 8px 10px 4px; border-radius: 9px; border: 1px solid var(--line-2); background: var(--bg); }
 .sm-restore { display: inline-flex; align-items: center; gap: 5px; }
 .sm-ask-list { grid-column: 1 / -1; min-width: 0; margin: 0; padding: 0; list-style: none; font-size: 12.5px; color: var(--fg); line-height: 1.6; }
 .sm-ask-list li { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sm-ask-list li.more { color: var(--muted); }
-.sm-ask-path { grid-column: 1 / -1; min-width: 0; margin: 0; font-family: var(--code); font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+.sm-ask-path { grid-column: 1 / -1; min-width: 0; margin: 0; font-family: var(--code-font, var(--code)); font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+:where(html[data-fonts]) .sm-ask-path { font-style: var(--code-style, inherit); font-weight: var(--code-weight, inherit); font-stretch: var(--code-stretch, 100%); }
 @media (max-width: 560px) {
   .sm-filter { width: 130px; flex-basis: 130px; }
   .row.sm-folder .sm-path { display: none; }
@@ -69,8 +74,21 @@
 .sm-provider-text { min-width: 0; font-size: 12px; color: var(--fg-2); line-height: 1.45; }
 .sm-provider .grow { flex: 1; }
 .sm-provider .text { flex: none; display: inline-flex; align-items: center; gap: 5px; }
-.sm-prov { display: inline-block; padding: 0 5px; border-radius: 4px; background: var(--pill); color: var(--muted); font-family: var(--code); font-size: 10.5px; line-height: 16px; }
+.sm-prov { display: inline-block; padding: 0 5px; border-radius: 4px; background: var(--pill); color: var(--muted); font-family: var(--code-font, var(--code)); font-size: 10.5px; line-height: 16px; }
+:where(html[data-fonts]) .sm-prov { font-style: var(--code-style, inherit); font-weight: var(--code-weight, inherit); font-stretch: var(--code-stretch, 100%); }
 .sm-provider-list li label { display: flex; align-items: center; gap: 8px; min-width: 0; cursor: pointer; }
 .sm-provider-list li .name { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sm-provider-list li .note { flex: none; font-size: 11px; color: var(--faint); }
 .sm-provider-list { max-height: min(300px, 45vh); overflow-y: auto; }
+/* Recording gateway conversations (#1355): a setting card above the list,
+   its switch, what it keeps and where, and a labelled delete */
+.list.row.sm-record { gap: 6px 12px; min-height: 48px; padding: 9px 11px 9px 13px; height: auto; flex-wrap: wrap; }
+.sm-record .lib-switch { cursor: pointer; padding: 0; border: 0; }
+.sm-record .lib-switch:disabled { opacity: .5; cursor: default; }
+.sm-record-words { flex: 1 1 240px; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.sm-record-name { font-size: 12.5px; font-weight: 500; color: var(--fg); }
+.sm-record-sub { font-size: 11.5px; color: var(--muted); line-height: 1.45; }
+.sm-record-clear { flex: none; margin-left: auto; display: inline-flex; align-items: center; gap: 5px; }
+.sm-record-clear:hover:not(:disabled) { color: var(--red); background: var(--red-soft); }
+/* a folder's next page of sessions, under the ones drawn */
+.sm-group .sm-more { margin: 4px 8px 6px; }

@@ -26,10 +26,13 @@
 // plugin's getAuth, client.auth.set and loader see that account alone.
 
 import { AsyncLocalStorage } from "node:async_hooks"
+import dns from "node:dns"
 import fs from "node:fs"
+import http2 from "node:http2"
 import net from "node:net"
 import path from "node:path"
 import readline from "node:readline"
+import { Duplex } from "node:stream"
 import tls from "node:tls"
 import { pathToFileURL } from "node:url"
 
@@ -224,6 +227,11 @@ process.stdout.write = (chunk, enc, cb) => process.stderr.write(chunk, enc, cb)
 // MAGPIE_*_PROXY (see below), so `grok login`, which the Grok plugin runs,
 // went out with none and, where x.ai is reached only through one, printed
 // no link to open (𝕏 on Discord). One the plugin set itself is kept.
+// Node's fetch goes past *_PROXY unless NODE_USE_ENV_PROXY=1 says to take
+// them, so a plugin downloading in a Node program it starts went out with
+// none and failed where the vendor is reached only through one (larchsis
+// on 𝕏, Windows 11, a proxy set in magpie only). It is told to, unless
+// the plugin said otherwise.
 const own = (v, fd) => v === "inherit" || v === fd || v === (fd ? process.stdout : process.stdin)
 const PROXY_VARS = ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"]
 function proxied(env) {
@@ -232,11 +240,12 @@ function proxied(env) {
   const mine = via.getStore()
   if (mine === "direct") return env
   const set = mine ? { HTTPS_PROXY: mine, HTTP_PROXY: mine } : { HTTPS_PROXY: globalProxy.https, HTTP_PROXY: globalProxy.http, NO_PROXY: proxyVar("NO_PROXY") }
+  if (set.HTTPS_PROXY || set.HTTP_PROXY) set.NODE_USE_ENV_PROXY = "1"
   for (const [k, v] of Object.entries(set)) {
     if (!v || Object.keys(env).some((e) => e.toUpperCase() === k)) continue
     env[k] = v
     // Windows' names are one whatever their case
-    if (process.platform !== "win32") env[k.toLowerCase()] = v
+    if (process.platform !== "win32" && k.endsWith("_PROXY") && k !== "NODE_USE_ENV_PROXY") env[k.toLowerCase()] = v
   }
   return env
 }
@@ -265,6 +274,9 @@ let modelsDevPath = ""
 let piPath = "" // pi.js, which loads pi's extensions
 let directory = process.cwd()
 let userConfig = {}
+// prefer is the plugin the user picked for a provider id more than one
+// plugin signs in to: id → its spec (plugins.json's prefer)
+let prefer = {}
 const hooks = [] // {spec, hooks}
 const loaded = [] // {spec, id, error}
 const loaders = new Map() // account → options the auth loader returned
@@ -312,24 +324,103 @@ function loopback(host) {
   return host === "localhost" || host.endsWith(".localhost") || host === "::1" || /^127\./.test(host)
 }
 
-// proxyFor is the proxy a fetch of input goes through, "" for none.
-function proxyFor(input) {
+// A host on the user's own network — another computer's magpie, an LLM
+// relay on the NAS — is reached directly, whatever proxy the host was
+// started with, as magpie's own requests reach it (netproxy.onLAN, lan.go,
+// #982, #1572): a proxy is for reaching vendors; one elsewhere can't reach
+// the user's network, and one here only goes there directly itself. A
+// provider's own proxy (via) is still taken as it is. The rule is lan.go's:
+// keep the two the same.
+
+// lanWait is how long a name is looked up for before it is taken as not on
+// the network; lanKeep is how long what it resolved to is kept.
+const lanWait = 400
+const lanKeep = 60_000
+const lanSeen = new Map() // host → {lan: Promise<boolean>, at}
+
+// ipBytes is the 16 bytes of the IPv6 address s (an IPv4 one as
+// ::ffff:a.b.c.d), null when s is no address.
+function ipBytes(s) {
+  if (net.isIPv4(s)) return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, ...s.split(".").map(Number)]
+  if (!net.isIPv6(s)) return null
+  s = s.replace(/%.*$/, "")
+  const v4 = s.match(/(\d+\.\d+\.\d+\.\d+)$/)
+  if (v4) {
+    const [a, b, c, d] = v4[1].split(".").map(Number)
+    s = s.slice(0, -v4[1].length) + ((a << 8) | b).toString(16) + ":" + ((c << 8) | d).toString(16)
+  }
+  const [head, tail] = s.includes("::") ? s.split("::") : [s, null]
+  const words = (x) => (x ? x.split(":").map((w) => parseInt(w, 16)) : [])
+  const h = words(head)
+  const t = words(tail)
+  const all = tail === null ? h : [...h, ...Array(8 - h.length - t.length).fill(0), ...t]
+  return all.flatMap((w) => [w >> 8, w & 0xff])
+}
+
+// lanIP is netproxy.lanIP: a private (10/8, 172.16/12, 192.168/16,
+// fc00::/7), link-local (169.254/16, fe80::/10), loopback or carrier-grade
+// NAT (Tailscale's 100.64/10) address.
+function lanIP(s) {
+  const b = ipBytes(s)
+  if (!b) return false
+  if (b.slice(0, 10).every((x) => x === 0) && b[10] === 0xff && b[11] === 0xff) {
+    const [p, q] = b.slice(12)
+    return p === 10 || (p === 172 && (q & 0xf0) === 16) || (p === 192 && q === 168) || (p === 169 && q === 254) || p === 127 || (p === 100 && (q & 0xc0) === 64)
+  }
+  return (b[0] & 0xfe) === 0xfc || (b[0] === 0xfe && (b[1] & 0xc0) === 0x80) || b.every((x, i) => x === (i === 15 ? 1 : 0))
+}
+
+// onLAN is netproxy.onLAN: whether host is on the user's own network — an
+// address lanIP takes, a .local name, or a name every address of which is
+// one of those. A name that doesn't resolve here (in lanWait) is not: the
+// proxy is what reaches it.
+function onLAN(host) {
+  host = host.toLowerCase().replace(/\.$/, "")
+  if (!host) return Promise.resolve(false)
+  if (net.isIP(host)) return Promise.resolve(lanIP(host))
+  if (host.endsWith(".local")) return Promise.resolve(true)
+  const seen = lanSeen.get(host)
+  if (seen && Date.now() - seen.at < lanKeep) return seen.lan
+  let timer
+  const lan = Promise.race([
+    dns.promises.lookup(host, { all: true, verbatim: true }).then(
+      (as) => as.length > 0 && as.every((a) => lanIP(a.address)),
+      () => false,
+    ),
+    new Promise((r) => (timer = setTimeout(() => r(false), lanWait))),
+  ]).finally(() => clearTimeout(timer))
+  if (lanSeen.size >= 256) lanSeen.clear()
+  lanSeen.set(host, { lan, at: Date.now() })
+  return lan
+}
+
+// proxyOf is the proxy a request to input goes through, "" for none, and
+// whether it is the global one, which a host on the user's own network
+// goes around (proxyFor).
+function proxyOf(input) {
   const u = hostOf(input)
-  if (!u || loopback(u.host)) return ""
+  if (!u || loopback(u.host)) return { p: "" }
   const own = via.getStore()
-  if (own === "direct") return ""
-  if (own) return own
-  if (globalProxy.no.some((n) => n === "*" || u.host === n || u.host.endsWith("." + n))) return ""
-  return u.protocol === "https:" ? globalProxy.https : u.protocol === "http:" ? globalProxy.http : ""
+  if (own === "direct") return { p: "" }
+  if (own) return { p: own }
+  if (globalProxy.no.some((n) => n === "*" || u.host === n || u.host.endsWith("." + n))) return { p: "" }
+  const p = u.protocol === "https:" ? globalProxy.https : u.protocol === "http:" ? globalProxy.http : ""
+  return { p, global: !!p, host: u.host }
+}
+
+// proxyFor is the proxy a fetch of input goes through, "" for none.
+async function proxyFor(input) {
+  const { p, global, host } = proxyOf(input)
+  return global && (await onLAN(host)) ? "" : p
 }
 
 // reach is what a check's fetches came to: whether one got an answer, and
 // the first that got none
 const reach = new AsyncLocalStorage()
 
-function sent(input, init) {
+async function sent(input, init) {
   if (init && "proxy" in init) return bunFetch(input, init)
-  const p = proxyFor(input)
+  const p = await proxyFor(input)
   if (!p) return bunFetch(input, init)
   return bunFetch(input, { ...init, proxy: p }).catch(async (e) => {
     if (e?.name === "AbortError" || init?.signal?.aborted) throw e
@@ -410,7 +501,30 @@ function asked(input, init) {
   )
 }
 
+// MAGPIE_ONLY are the headers magpie tells a plugin's fetch where the agent
+// that asked works with (WorkDirHeader and WorkGitHeader in
+// internal/provider): for the plugin to read, never for its vendor, so a
+// plugin that sends on the headers it was given sends them nowhere.
+const MAGPIE_ONLY = ["x-magpie-work-dir", "x-magpie-work-git"]
+
+function unsaid(input, init) {
+  if (input instanceof Request && MAGPIE_ONLY.some((k) => input.headers.has(k))) {
+    const h = new Headers(input.headers)
+    for (const k of MAGPIE_ONLY) h.delete(k)
+    input = new Request(input, { headers: h })
+  }
+  if (init?.headers) {
+    const h = new Headers(init.headers)
+    if (MAGPIE_ONLY.some((k) => h.has(k))) {
+      for (const k of MAGPIE_ONLY) h.delete(k)
+      init = { ...init, headers: h }
+    }
+  }
+  return [input, init]
+}
+
 globalThis.fetch = Object.assign(function fetch(input, init) {
+  ;[input, init] = unsaid(input, init)
   const r = reach.getStore()
   if (!r) return asked(input, init)
   return asked(input, init).then(
@@ -422,43 +536,290 @@ globalThis.fetch = Object.assign(function fetch(input, init) {
   )
 }, bunFetch)
 
+// An HTTP/2 session a plugin opens itself goes through the proxy its
+// fetches take, as a built-in's requests on Go's transport did. Cursor's
+// plugin runs agent.v1.AgentService/Run on node:http2, which Bun connects
+// directly, *_PROXY or not: where Cursor is reached only through magpie's
+// proxy (the system's, or one set in magpie), its sign-in, models and
+// usage came through and every chat went out without it (#1035).
+const h2connect = http2.connect
+http2.connect = function connect(authority, options, listener) {
+  if (typeof options === "function") [listener, options] = [options, undefined]
+  let u
+  try {
+    u = typeof authority === "string" ? new URL(authority) : authority instanceof URL ? authority : new URL(`${authority.protocol ?? "https:"}//${authority.host ?? authority.hostname}`)
+  } catch {
+    return h2connect.call(this, authority, options, listener)
+  }
+  const { p, global } = options?.createConnection ? { p: "" } : proxyOf(u.href)
+  if (!p) return h2connect.call(this, authority, options, listener)
+  const host = u.hostname.replace(/^\[|\]$/g, "")
+  const port = Number(u.port || (u.protocol === "http:" ? 80 : 443))
+  // the session is returned now, and its connection made once it is known
+  // whether host is on the user's own network (direct) or not (the proxy)
+  const raw = tunnel(global ? onLAN(host).then((lan) => (lan ? "" : p)) : p, host, port)
+  const createConnection = () =>
+    u.protocol === "http:" ? raw : tls.connect({ ...options, socket: raw, servername: options?.servername || (net.isIP(host) ? undefined : host), ALPNProtocols: ["h2"] })
+  const session = h2connect.call(this, authority, { ...options, createConnection }, listener)
+  // the tunnel's failure is the session's: Bun's TLS over a stream leaves
+  // the stream's errors unheard (one unheard ends the host), and says a
+  // tunnel that never came as "h2 is not supported"
+  raw.on("error", (e) => session.destroy(e))
+  return session
+}
+
+// tunnel is a connection to host:port through the HTTP proxy which names
+// (a proxy, or a promise of one), or straight to it when that is "" (a host
+// on the user's own network, onLAN). A SOCKS proxy is handed to the host as
+// an HTTP bridge to it, netproxy.ForBun: its CONNECT is asked first, and
+// what is written waits for the tunnel. A proxy that turns it away fails
+// it in Go's words ("proxyconnect …").
+function tunnel(which, host, port) {
+  const target = `${host.includes(":") ? `[${host}]` : host}:${port}`
+  let ready = false
+  let sock = null
+  let ended = false
+  let gone = false
+  const queued = []
+  const conn = new Duplex({
+    read() {},
+    write(chunk, enc, cb) {
+      if (ready) sock.write(chunk, cb)
+      else queued.push([chunk, cb])
+    },
+    final(cb) {
+      if (ready) sock.end()
+      else ended = true
+      cb()
+    },
+    destroy(err, cb) {
+      gone = true
+      sock?.destroy()
+      cb(err)
+    },
+  })
+  const open = () => {
+    ready = true
+    sock.on("data", (d) => conn.push(d))
+    for (const [c, cb] of queued.splice(0)) sock.write(c, cb)
+    if (ended) sock.end()
+  }
+  Promise.resolve(which).then((p) => {
+    if (gone) return
+    if (!p) {
+      sock = net.connect({ host, port })
+      sock.once("connect", open)
+      sock.on("end", () => conn.push(null))
+      sock.on("error", (e) => conn.destroy(e))
+      return
+    }
+    const pu = new URL(p)
+    const ph = pu.hostname.replace(/^\[|\]$/g, "")
+    const pp = Number(pu.port || (pu.protocol === "https:" ? 443 : 80))
+    sock = pu.protocol === "https:" ? tls.connect({ host: ph, port: pp, servername: net.isIP(ph) ? undefined : ph }) : net.connect({ host: ph, port: pp })
+    sock.once(pu.protocol === "https:" ? "secureConnect" : "connect", () => {
+      let req = `CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n`
+      if (pu.username) {
+        const cred = `${decodeURIComponent(pu.username)}:${decodeURIComponent(pu.password)}`
+        req += `Proxy-Authorization: Basic ${Buffer.from(cred).toString("base64")}\r\n`
+      }
+      sock.write(req + "\r\n")
+    })
+    let got = Buffer.alloc(0)
+    const head = (chunk) => {
+      got = Buffer.concat([got, chunk])
+      const end = got.indexOf("\r\n\r\n")
+      if (end < 0) {
+        if (got.length > 8192) conn.destroy(new Error(`proxyconnect tcp: ${ph}:${pp} answered CONNECT with no HTTP`))
+        return
+      }
+      sock.off("data", head)
+      const status = got.subarray(0, got.indexOf("\r\n")).toString("latin1").replace(/^HTTP\/\d(\.\d)?\s+/, "")
+      if (!/^2\d\d/.test(status)) {
+        const body = got.subarray(end + 4, end + 304).toString("utf8").trim()
+        return conn.destroy(new Error(`proxyconnect tcp: ${body ? `${status}: ${body}` : status}`))
+      }
+      if (got.length > end + 4) conn.push(got.subarray(end + 4))
+      open()
+    }
+    sock.on("data", head)
+    sock.on("end", () => conn.push(null))
+    sock.on("error", (e) => conn.destroy(ready ? e : new Error(`proxyconnect tcp: dial tcp ${ph}:${pp}: ${e?.message || e?.code || e}`)))
+  }).catch((e) => conn.destroy(e))
+  return conn
+}
+
 // ---- auth.json ---------------------------------------------------------------
 
-function readAuth() {
-  let text
+// A crash can leave plugin-auth.json at its full length with every byte
+// zero (#1505). Such a file is unknown, never "no sign-ins": it is read
+// from its last good generation, plugin-auth.json.bak, which each write
+// keeps first; a write over one that doesn't read copies it aside
+// (plugin-auth.json.bad-<time>) first, and never writes none over it. As
+// internal/lastgood does for magpie's own files.
+
+// parseAuth is the sign-ins in text, null when it isn't one JSON object.
+function parseAuth(text) {
+  try {
+    const v = JSON.parse(text)
+    return v && typeof v === "object" && !Array.isArray(v) ? v : null
+  } catch {
+    return null
+  }
+}
+
+function readFileSteady(p) {
   for (let i = 0; ; i++) {
     try {
-      text = fs.readFileSync(authPath, "utf8")
-      break
+      return fs.readFileSync(p)
     } catch (e) {
-      if (e?.code === "ENOENT") return {}
+      if (e?.code === "ENOENT") return null
       // Windows refuses a file being renamed over for a moment: read as
       // none, the next setAuth would write the others' accounts away
       if (i >= 50) throw e
       pause(10)
     }
   }
+}
+
+// describeBad says what is wrong with a file that doesn't read.
+function describeBad(buf) {
+  if (buf.length > 0 && buf.every((b) => b === 0)) return `${buf.length} bytes, every one zero`
+  if (buf.toString("utf8").trim() === "") return "it is empty"
+  return "it doesn't parse"
+}
+
+let authRecovered = false
+let authUnread = false
+
+// readAuthState is the sign-ins and whether they are known: a file not
+// there is none, known; one that doesn't read is its .bak's, known, or
+// none, unknown.
+function readAuthState() {
+  const buf = readFileSteady(authPath)
+  if (buf === null) return { all: {}, known: true }
+  const v = parseAuth(buf.toString("utf8"))
+  if (v) return { all: v, known: true }
+  const why = describeBad(buf)
+  let bak = null
   try {
-    const v = JSON.parse(text)
-    return v && typeof v === "object" ? v : {}
-  } catch {
-    return {}
+    bak = parseAuth(fs.readFileSync(authPath + ".bak", "utf8"))
+  } catch {}
+  if (bak) {
+    if (!authRecovered) {
+      authRecovered = true
+      toErr(`plugin-auth.json can't be read (${why}); the sign-ins in plugin-auth.json.bak are used`)
+      send({ event: "recovered", said: why })
+    }
+    return { all: bak, known: true }
   }
+  if (!authUnread) {
+    authUnread = true
+    toErr(`plugin-auth.json can't be read (${why}) and has no good backup`)
+  }
+  return { all: {}, known: false }
+}
+
+function readAuth() {
+  return readAuthState().all
+}
+
+// writeDurable replaces p with data through a temp file flushed to the
+// disk before it is renamed over p: a rename reaches the disk on its own
+// schedule, the data behind it later, and a machine that went down between
+// the two left plugin-auth.json all zero (#1505). A write or flush that
+// fails leaves p as it was.
+function writeDurable(p, data) {
+  const tmp = p + ".tmp-" + process.pid
+  try {
+    const f = fs.openSync(tmp, "w", 0o600)
+    try {
+      for (let off = 0; off < data.length; ) off += fs.writeSync(f, data, off, data.length - off)
+      fs.fsyncSync(f)
+    } finally {
+      fs.closeSync(f)
+    }
+    // and a file held open by a reader refuses to be renamed over
+    for (let i = 0; ; i++) {
+      try {
+        return fs.renameSync(tmp, p)
+      } catch (e) {
+        if (i >= 50 || !["EPERM", "EACCES", "EBUSY"].includes(e?.code)) throw e
+        pause(10)
+      }
+    }
+  } catch (e) {
+    try {
+      fs.unlinkSync(tmp)
+    } catch {}
+    throw e
+  }
+}
+
+// badStamp is the time a bad file is kept under, as Go's lastgood names it.
+function badStamp(d = new Date()) {
+  const p = (n) => String(n).padStart(2, "0")
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+}
+
+// keepBad copies buf, a plugin-auth.json that doesn't read, aside: two
+// within one second are both kept (-2, …), the same bytes kept already
+// not again.
+function keepBad(buf) {
+  const stamp = authPath + ".bad-" + badStamp()
+  for (let i = 1; i < 1000; i++) {
+    const name = i > 1 ? `${stamp}-${i}` : stamp
+    let f
+    try {
+      f = fs.openSync(name, "wx", 0o600)
+    } catch (e) {
+      if (e?.code !== "EEXIST") throw e
+      let old = null
+      try {
+        old = fs.readFileSync(name)
+      } catch {}
+      if (old && old.equals(buf)) return name
+      continue
+    }
+    try {
+      for (let off = 0; off < buf.length; ) off += fs.writeSync(f, buf, off, buf.length - off)
+      fs.fsyncSync(f)
+    } catch (e) {
+      fs.closeSync(f)
+      try {
+        fs.unlinkSync(name)
+      } catch {}
+      throw e
+    }
+    fs.closeSync(f)
+    toErr(`plugin-auth.json can't be read (${describeBad(buf)}); it is kept as ${path.basename(name)}`)
+    return name
+  }
+  throw new Error("plugin-auth.json can't be read and there is no free name to keep it under")
+}
+
+// keepAuth is called before plugin-auth.json is replaced: the file there
+// now becomes plugin-auth.json.bak when it reads, or is copied aside when
+// it doesn't. A failure stops the write.
+function keepAuth() {
+  const buf = readFileSteady(authPath)
+  if (buf === null) return
+  if (!parseAuth(buf.toString("utf8"))) {
+    keepBad(buf)
+    return
+  }
+  const bak = authPath + ".bak"
+  let old = null
+  try {
+    old = fs.readFileSync(bak)
+  } catch {}
+  if (!old || !old.equals(buf)) writeDurable(bak, buf)
 }
 
 function writeAuth(all) {
   fs.mkdirSync(path.dirname(authPath), { recursive: true })
-  const tmp = authPath + ".tmp-" + process.pid
-  fs.writeFileSync(tmp, JSON.stringify(all, null, 2) + "\n", { mode: 0o600 })
-  // and a file held open by a reader refuses to be renamed over
-  for (let i = 0; ; i++) {
-    try {
-      return fs.renameSync(tmp, authPath)
-    } catch (e) {
-      if (i >= 50 || !["EPERM", "EACCES", "EBUSY"].includes(e?.code)) throw e
-      pause(10)
-    }
-  }
+  keepAuth()
+  writeDurable(authPath, Buffer.from(JSON.stringify(all, null, 2) + "\n"))
 }
 
 function pause(ms) {
@@ -505,9 +866,11 @@ function lockAuth() {
 function changeAuth(change) {
   const unlock = lockAuth()
   try {
-    const all = readAuth()
+    const { all, known } = readAuthState()
     const out = change(all)
-    if (out !== false) writeAuth(all)
+    // sign-ins that don't read are never written over with none: a
+    // sign-out of one of them waits for the file to be put right
+    if (out !== false && (known || Object.keys(all).length > 0)) writeAuth(all)
     return out
   } finally {
     unlock()
@@ -735,7 +1098,12 @@ function entries(target) {
     const p = path.join(target, f)
     if (fs.existsSync(p)) out.push(p)
   }
-  if (out.length === 0) throw new Error(`plugin ${target} has no entry (package.json main, exports or index file)`)
+  if (out.length === 0) {
+    // a command alone (bin), an MCP server, is no plugin at all (#1327)
+    const cmd = pkg?.bin ? ", only a command (bin). If it is an MCP server, add it under Library → MCP servers instead" : ""
+    // said without a stack: there is no fault in the host to trace
+    throw Object.assign(new Error(`${pkg?.name || target} isn't an OpenCode or magpie plugin: its package names no file to load (no main or exports in package.json, no index file)${cmd}`), { plain: true })
+  }
   return [...new Set(out)]
 }
 
@@ -798,7 +1166,7 @@ async function loadPlugins(list) {
       for (const fn of fns) hooks.push({ spec: p.spec, target: p.target, hooks: (await fn(input, p.options)) ?? {} })
       loaded.push({ spec: p.spec })
     } catch (e) {
-      loaded.push({ spec: p.spec, error: String(e?.stack ?? e) })
+      loaded.push({ spec: p.spec, error: e?.plain ? e.message : String(e?.stack ?? e) })
     }
   }
   config = { provider: {}, ...structuredClone(userConfig) }
@@ -813,11 +1181,32 @@ async function loadPlugins(list) {
 }
 
 // auths are the auth hooks by provider, the last plugin to name one
-// winning, as in OpenCode.
+// winning, as in OpenCode, unless the user picked one of them for it
+// (prefer): a plugin of their own beside a third party's that signs in to
+// the same provider id is then theirs to choose, not the list's order.
 function auths() {
   const m = new Map()
   for (const h of hooks) if (h.hooks.auth?.provider) m.set(h.hooks.auth.provider, { spec: h.spec, target: h.target, auth: h.hooks.auth })
+  for (const h of hooks) {
+    const id = h.hooks.auth?.provider
+    if (id && prefer[id] === h.spec) m.set(id, { spec: h.spec, target: h.target, auth: h.hooks.auth })
+  }
   return m
+}
+
+// signsIn are the provider ids the plugin spec's auth hooks name.
+const signsIn = (spec) => [...new Set(hooks.filter((h) => h.spec === spec && h.hooks.auth?.provider).map((h) => h.hooks.auth.provider))]
+
+// withProviders is a loaded plugin as init tells magpie of it: the provider
+// ids it signs in to, and for each one another plugin serves (two plugins
+// naming one id: the host runs one), the plugin that does. magpie says so
+// on the plugin's row rather than leave its provider missing.
+function withProviders(l) {
+  const ids = l.error ? [] : signsIn(l.spec)
+  if (!ids.length) return l
+  const a = auths()
+  const servedBy = Object.fromEntries(ids.filter((id) => a.get(id) && a.get(id).spec !== l.spec).map((id) => [id, a.get(id).spec]))
+  return { ...l, provides: ids, ...(Object.keys(servedBy).length ? { servedBy } : {}) }
 }
 
 function authOf(provider) {
@@ -842,6 +1231,22 @@ function cost(c) {
   }
 }
 
+// MODALITIES are the kinds of input and output OpenCode's capabilities
+// name, in its order.
+const MODALITIES = ["text", "image", "audio", "video", "pdf"]
+
+// modalities is a models.dev or config modalities list as capabilities
+// has it: each kind true or false, text when it lists none.
+const modalities = (list) => Object.fromEntries(MODALITIES.map((k) => [k, (list ?? ["text"]).includes(k)]))
+
+// kinds are the kinds a capabilities.input or .output says yes to, for
+// magpie: undefined when the plugin gave none.
+function kinds(c) {
+  if (!c || typeof c !== "object") return undefined
+  const out = Object.keys(c).filter((k) => c[k] === true)
+  return out.length ? out : undefined
+}
+
 // fromModelsDev is a models.dev model as OpenCode's provider list has it.
 function fromModelsDev(p, m) {
   return {
@@ -860,14 +1265,8 @@ function fromModelsDev(p, m) {
       reasoning: m.reasoning ?? false,
       attachment: m.attachment ?? false,
       toolcall: m.tool_call ?? true,
-      input: {
-        text: true,
-        image: (m.modalities?.input ?? []).includes("image"),
-        audio: (m.modalities?.input ?? []).includes("audio"),
-        video: (m.modalities?.input ?? []).includes("video"),
-        pdf: (m.modalities?.input ?? []).includes("pdf"),
-      },
-      output: { text: true, image: false, audio: false, video: false, pdf: false },
+      input: { ...modalities(m.modalities?.input), text: true },
+      output: modalities(m.modalities?.output),
       interleaved: m.interleaved ?? false,
     },
     release_date: m.release_date ?? "",
@@ -892,6 +1291,9 @@ async function info(id, key, strict) {
     options: { ...(cfg?.options ?? {}) },
     npm: cfg?.npm ?? md?.npm,
     api: cfg?.api ?? md?.api,
+    // magpie's own field: the plugin serves a decision API (System One)
+    // for this provider, asked at its base /systemone through its fetch
+    decide: cfg?.decide === true,
     models: {},
   }
   if (md) for (const m of Object.values(md.models ?? {})) out.models[m.id] = fromModelsDev(md, m)
@@ -913,14 +1315,21 @@ async function info(id, key, strict) {
         ...(m.reasoning !== undefined ? { reasoning: m.reasoning } : {}),
         ...(m.attachment !== undefined ? { attachment: m.attachment } : {}),
         ...(m.tool_call !== undefined ? { toolcall: m.tool_call } : {}),
-        ...(m.modalities?.input ? { input: Object.fromEntries(["text", "image", "audio", "video", "pdf"].map((k) => [k, m.modalities.input.includes(k)])) } : {}),
+        ...(m.modalities?.input ? { input: modalities(m.modalities.input) } : {}),
+        ...(m.modalities?.output ? { output: modalities(m.modalities.output) } : {}),
       },
       variants: m.variants ?? was?.variants ?? {},
+      // magpie's own mark: a decision model, answering System One
+      ...(typeof m.decides === "boolean" ? { decides: m.decides } : was?.decides !== undefined ? { decides: was.decides } : {}),
     }
   }
+  const server = auths().get(id)?.spec
   for (const h of hooks) {
     const ph = h.hooks.provider
     if (ph?.id !== id || typeof ph.models !== "function") continue
+    // a plugin that signs in to id too but doesn't serve it: its list
+    // would be asked with the serving plugin's account
+    if (server && h.spec !== server && signsIn(h.spec).includes(id)) continue
     const k = key ?? accountsOf(readAuth(), id)[0] ?? id
     await fresh(id, k)
     const all = readAuth()
@@ -1039,6 +1448,8 @@ async function providers({ proxies } = {}) {
       methods: methods(a.auth),
       icon: iconOf(a),
       usage: typeof a.auth.usage === "function",
+      checkin: typeof a.auth.checkin === "function",
+      decide: p.decide === true,
       maxConcurrency: concurrencyOf(a),
       signedIn: keys.length > 0,
       authType: first?.type ?? "",
@@ -1068,6 +1479,9 @@ async function providers({ proxies } = {}) {
           reasoning: !!m.capabilities?.reasoning,
           image: !!m.capabilities?.input?.image,
           imageSaid: typeof m.capabilities?.input?.image === "boolean",
+          // every kind it takes and gives, not image alone (#1595)
+          inputs: kinds(m.capabilities?.input),
+          outputs: kinds(m.capabilities?.output),
           released: m.release_date ?? "",
           cost: m.cost,
           variants: Object.keys(m.variants ?? {}),
@@ -1076,6 +1490,11 @@ async function providers({ proxies } = {}) {
           // and before a discount running now (Qoder's price_factor)
           rate: rateOf(m.rate),
           rateWas: rateOf(m.rateWas),
+          // run fast when the request's service_tier is priority (Cursor's)
+          fast: m.fast === true,
+          // a decision model (System One's), hidden from agents and
+          // offered as a routing group's classifier
+          decides: m.decides === true,
         })),
     })
   }
@@ -1146,7 +1565,11 @@ function signInKey(provider, account) {
 
 let nextSession = 1
 
-async function authorize({ provider, method, inputs, account }) {
+// A sign-in goes through the proxy its subscription's requests will (proxy,
+// as fetch's: "", "direct" or its URL), so the vendor sees the account
+// come from one place from its first request on (#1663): authorize and the
+// callback that trades the code are both run under it.
+async function authorize({ provider, method, inputs, account, proxy }) {
   const m = authOf(provider).methods[method]
   if (!m) throw new Error(`no sign-in method ${method} for ${provider}`)
   if (m.type !== "oauth") throw new Error("not an oauth method")
@@ -1156,9 +1579,9 @@ async function authorize({ provider, method, inputs, account }) {
   // auth login) calls, and a plugin told so asks its questions on the
   // terminal, magpie's stdin here (opencode-antigravity-auth waited on its
   // "Project ID" prompt, the sign-in never starting)
-  const a = await inScope(provider, key, () => m.authorize(m.prompts?.length ? inputs ?? {} : undefined))
+  const a = await via.run(proxy ?? "", () => inScope(provider, key, () => m.authorize(m.prompts?.length ? inputs ?? {} : undefined)))
   const session = String(nextSession++)
-  sessions.set(session, { provider, key, a, inputs })
+  sessions.set(session, { provider, key, a, inputs, proxy: proxy ?? "" })
   return { session, url: a.url ?? "", instructions: a.instructions ?? "", method: a.method }
 }
 
@@ -1173,12 +1596,12 @@ async function callback({ session, code }) {
   const s = sessions.get(session)
   if (!s) throw new Error("no such sign-in")
   sessions.delete(session)
-  const r = await inScope(s.provider, s.key, () => (s.a.method === "code" ? s.a.callback(code ?? "") : s.a.callback()))
+  const r = await via.run(s.proxy, () => inScope(s.provider, s.key, () => (s.a.method === "code" ? s.a.callback(code ?? "") : s.a.callback())))
   if (!r || r.type !== "success") return failed(r)
   return { ok: true, ...save(s.provider, s.key, r, undefined) }
 }
 
-async function apiKey({ provider, method, inputs, key, account }) {
+async function apiKey({ provider, method, inputs, key, account, proxy }) {
   const m = authOf(provider).methods[method]
   if (!m || m.type !== "api") throw new Error("not an API key method")
   const at = signInKey(provider, account)
@@ -1187,7 +1610,7 @@ async function apiKey({ provider, method, inputs, key, account }) {
     setAuth(at, { type: "api", key, ...md })
     return { ok: true, provider, account: settle(provider, at) }
   }
-  const r = await inScope(provider, at, () => m.authorize(inputs ?? {}))
+  const r = await via.run(proxy ?? "", () => inScope(provider, at, () => m.authorize(inputs ?? {})))
   if (!r || r.type !== "success") return failed(r)
   return { ok: true, ...save(provider, at, r, inputs, key) }
 }
@@ -1330,7 +1753,8 @@ async function load({ provider, account, proxy }) {
 //       count, when it counts in amounts: amount of limit used, in unit,
 //       "credits"), span? (seconds the window runs), model? (a
 //       word in the ids of the only models it counts), models? / notModels?
-//       (the ids it counts, or all but these), aside? (using it up doesn't
+//       (the ids it counts, or all but these; a bare id and its id@size
+//       count as one), aside? (using it up doesn't
 //       stop the account) }],
 //     signIn?: "expired" | "kept" | "renewed" (what the read means for the
 //       account's sign-in, as a model request's X-Magpie-Sign-In says;
@@ -1386,6 +1810,43 @@ async function usageOf(provider, account) {
       aside: !!w?.aside,
     })),
   }
+}
+
+// ---- check-in ----------------------------------------------------------------
+
+// checkin presses the vendor's daily check-in (签到) for the account at key,
+// as the plugin's auth.checkin does it (magpie's own hook, which OpenCode
+// ignores; Lemon on Discord: 签到 belongs in the plugins):
+//   auth.checkin(getAuth, provider) → {
+//     outcome: "claimed" (checked in now) | "done" (in already today) |
+//       "ineligible" (the account can't take part) | "inactive" (no
+//       check-in running) | "captcha" (the vendor asks for a captcha: the
+//       user checks in in its own app; never solved) | "failed",
+//     credit? (what it gave), streak? (days in a row), message?
+//   }
+// magpie asks once a Beijing day per account while the user has it on, and
+// again later that day after a failure; a hook that throws is a failure.
+// Run in the account's scope, a token it renews is saved to that account.
+async function checkin({ provider, account, proxy }) {
+  return via.run(proxy ?? "", () => checkinOf(provider, account))
+}
+
+const checkinOutcomes = ["claimed", "done", "ineligible", "inactive", "captcha", "failed"]
+
+async function checkinOf(provider, account) {
+  const a = auths().get(provider)?.auth
+  if (typeof a?.checkin !== "function") throw new Error(`${provider}'s plugin doesn't check in`)
+  const key = accountKey(provider, account)
+  if (!readAuth()[key]) throw new Error("not signed in")
+  await fresh(provider, key)
+  const p = await info(provider, key)
+  const r = (await inScope(provider, key, () => a.checkin(async () => readAuth()[key], JSON.parse(JSON.stringify(p))))) ?? {}
+  const num = (v) => (typeof v === "number" && isFinite(v) ? Math.max(0, v) : 0)
+  const message = typeof r.message === "string" ? r.message : ""
+  if (!checkinOutcomes.includes(r.outcome)) {
+    return { outcome: "failed", credit: 0, streak: 0, message: message || `the plugin answered no outcome (${JSON.stringify(r.outcome ?? null)})` }
+  }
+  return { outcome: r.outcome, credit: num(r.credit), streak: Math.round(num(r.streak)), message }
 }
 
 // sdkHeaders are what the AI SDK package the model is on sends of the key.
@@ -1516,8 +1977,9 @@ const handlers = {
     piPath = p.piPath ?? ""
     directory = p.directory ?? directory
     userConfig = p.config ?? {}
+    prefer = p.prefer ?? {}
     await loadPlugins(p.plugins ?? [])
-    return { plugins: loaded }
+    return { plugins: loaded.map(withProviders) }
   },
   providers: (p) => providers(p ?? {}),
   prompt: async (p) => ({ prompt: await nextPrompt(p.provider, p.method, p.inputs ?? {}) }),
@@ -1527,6 +1989,7 @@ const handlers = {
   apiKey,
   load,
   usage,
+  checkin,
   // check tries one account as a request would: its loader, then its
   // models as the plugin lists them for it, then its usage, which asks the
   // vendor of the account itself. refused is the models hook saying the

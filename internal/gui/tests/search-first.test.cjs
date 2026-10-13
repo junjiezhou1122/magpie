@@ -10,6 +10,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { watchSettingsReads, settingsDrawn } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 const words = {
@@ -58,7 +59,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       page.on("pageerror", (e) => errors.push(e.message));
       const saved = [];
       await page.route("**/*", serve(lang, saved));
+      await watchSettingsReads(page);
       await page.goto("http://magpie.test/?view=settings&tab=models");
+      await settingsDrawn(page); // rows found are the ones that stay (#1659)
       const row = page.locator("#searchList #searchFirstRow");
       await row.waitFor();
       await row.scrollIntoViewIfNeeded();
@@ -76,6 +79,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(saved[0].searchFirst, "api");
       assert.equal(saved[0].searcher, "ds", "the rest kept");
       assert.equal(saved[0].redact, true);
+      // the save's answer draws Settings again, every option replaced: what is read
+      // and measured below is the page drawn from it
+      await page.waitForFunction(() => prefsBusy === 0);
       await page.locator("#searchFirstRow .segs button.on", { hasText: w.apis }).waitFor();
       assert((await page.locator("#searchList .row.search-add .sub").innerText()).includes(w.before));
       assert.deepEqual(await page.evaluate(() => [scrollX, scrollY, document.scrollingElement.scrollTop]), before, "the click moved nothing");
@@ -94,7 +100,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const page = await (await browser.newContext({ viewport: { width: 1100, height: 900 } })).newPage();
       page.setDefaultTimeout(5000);
       await page.route("**/*", serve(lang, [], { provider: false }));
+      await watchSettingsReads(page);
       await page.goto("http://magpie.test/?view=settings&tab=models");
+      await settingsDrawn(page); // rows found are the ones that stay (#1659)
       await page.locator("#searchList .row.search-add").waitFor();
       assert.equal(await page.locator("#searchFirstRow").count(), 0);
     });

@@ -45,6 +45,12 @@ import (
 //
 // magpie writes both files, so an older ZCode sees its models too. A model
 // the user set by hand in ZCode (a manual rule) keeps what they set.
+//
+// magpie's gateway answers all three of ZCode's API formats at the same
+// address (/v1/messages, /chat/completions, /responses), so the format the
+// user picked in ZCode's provider settings is theirs: a sync keeps it in both
+// files (zcodeFormat), and only a provider magpie adds new starts on
+// Anthropic Messages.
 
 func zcode(home string) *Agent {
 	dir := filepath.Join(home, ".zcode")
@@ -59,9 +65,11 @@ func zcode(home string) *Agent {
 		ID: "zcode", Name: "ZCode", Icon: "zcode", Aliases: []string{"z-code"},
 		UA:  []string{"zcode"},
 		Dir: dir, Path: path,
+		// its picker lists the models picked for it, in both files (#1508)
+		ListsModels: true,
 		Notice: func() string {
 			if Running(`ZCode\.app/`, `(^|/)ZCode( |$)`) {
-				return "ZCode reads its providers at start-up — restart ZCode to see magpie's models in its picker."
+				return noticeZcode.String()
 			}
 			return ""
 		},
@@ -106,6 +114,7 @@ func zcode(home string) *Agent {
 // turned off in ZCode stays off. A sync (keep) leaves an address on another
 // machine as it found it (zcodeAddress).
 func zcodeProviderJSON(path string, keep bool) any {
+	was := zcodeVariants(path)
 	ms := map[string]any{}
 	for _, m := range magpieModels("zcode") {
 		window := m.Context
@@ -124,7 +133,7 @@ func zcodeProviderJSON(path string, keep bool) any {
 		e := map[string]any{"name": m.Name, "limit": limit,
 			"modalities": map[string]any{"input": in, "output": []string{"text"}}}
 		if levels := zcodeLevels(m.Efforts); levels != nil {
-			e["reasoning"] = map[string]any{"enabled": true, "variants": levels, "defaultVariant": zcodeDefaultLevel(levels)}
+			e["reasoning"] = map[string]any{"enabled": true, "variants": levels, "defaultVariant": keptEffort(was[m.ID], levels, zcodeDefaultLevel(levels))}
 		}
 		ms[m.ID] = e
 	}
@@ -132,12 +141,35 @@ func zcodeProviderJSON(path string, keep bool) any {
 	if v, ok := edit.GetJSON(path, "provider."+magpieID+".enabled"); ok && v == "false" {
 		on = false
 	}
-	base, token := gateway.URL(), gateway.Token
+	base, token := gateway.URL(), hereKey()
 	if keep {
 		base, token = zcodeKept(filepath.Dir(path))
 	}
-	return map[string]any{"name": "magpie", "kind": "anthropic", "enabled": on, "source": "custom",
+	return map[string]any{"name": "magpie", "kind": zcodeKinds[zcodeFormat(filepath.Dir(path))], "enabled": on, "source": "custom",
 		"options": map[string]any{"apiKey": token, "baseURL": base}, "models": ms}
+}
+
+// zcodeVariants is the default variant each of magpie's models has in
+// config.json at path, which one set by hand keeps (keptEffort).
+func zcodeVariants(path string) map[string]string {
+	var c struct {
+		Provider map[string]struct {
+			Models map[string]struct {
+				Reasoning struct {
+					DefaultVariant string `json:"defaultVariant"`
+				} `json:"reasoning"`
+			} `json:"models"`
+		} `json:"provider"`
+	}
+	b, _ := edit.Read(path)
+	if json.Unmarshal(b, &c) != nil {
+		return nil
+	}
+	out := map[string]string{}
+	for id, m := range c.Provider[magpieID].Models {
+		out[id] = m.Reasoning.DefaultVariant
+	}
+	return out
 }
 
 // zcodeAddress is the address and key magpie's provider is synced with:
@@ -146,8 +178,8 @@ func zcodeProviderJSON(path string, keep bool) any {
 // keeps with its key. An address on this machine's loopback is magpie's own
 // and follows the gateway.
 func zcodeAddress(was, wasKey string) (string, string) {
-	if !onAnotherMachine(was) {
-		return gateway.URL(), gateway.Token
+	if !onAnotherMachine(was) || sameGateway(was, gateway.URL()) {
+		return gateway.URL(), hereKey()
 	}
 	if wasKey == "" {
 		wasKey = gateway.Token
@@ -189,6 +221,73 @@ func zcodeKept(dir string) (string, string) {
 	was, _ := edit.GetJSON(path, "provider."+magpieID+".options.baseURL")
 	wasKey, _ := edit.GetJSON(path, "provider."+magpieID+".options.apiKey")
 	return zcodeAddress(was, wasKey)
+}
+
+// zcodeKinds are ZCode's API formats in provider_config.json (api.type) and
+// the kind each is in config.json, as ZCode maps one to the other.
+var zcodeKinds = map[string]string{
+	"anthropic-messages":      "anthropic",
+	"openai-chat-completions": "openai-compatible",
+	"openai-responses":        "openai",
+}
+
+// zcodeFormat is the API format magpie's provider has in ZCode's files in
+// dir: the one the user picked in ZCode's settings, else Anthropic Messages.
+// magpie writes both files together, so where they differ the user changed
+// one of them in ZCode (provider_config.json from 3.14 on, config.json
+// before): the one written last has their choice, which is carried to the
+// other.
+func zcodeFormat(dir string) string {
+	rules, kind := zcodeRuleFormat(dir), ""
+	path := filepath.Join(dir, "config.json")
+	if k, _ := edit.GetJSON(path, "provider."+magpieID+".kind"); k != "" {
+		for f, fk := range zcodeKinds {
+			if fk == k {
+				kind = f
+			}
+		}
+	}
+	switch {
+	case kind == "" && rules == "":
+		return "anthropic-messages"
+	case kind == "":
+		return rules
+	case rules == "" || rules == kind:
+		return kind
+	}
+	a, errA := os.Stat(filepath.Join(dir, "provider_config.json"))
+	b, errB := os.Stat(path)
+	if errA == nil && errB == nil && b.ModTime().After(a.ModTime()) {
+		return kind
+	}
+	return rules
+}
+
+// zcodeRuleFormat is magpie's provider's API format in provider_config.json
+// in dir, or "" when it has none ZCode knows.
+func zcodeRuleFormat(dir string) string {
+	var r struct {
+		Config struct {
+			ProviderConfigRules struct {
+				ProviderRules []struct {
+					ProviderID string `json:"providerId"`
+					Config     struct {
+						API struct {
+							Type string `json:"type"`
+						} `json:"api"`
+					} `json:"config"`
+				} `json:"providerRules"`
+			} `json:"providerConfigRules"`
+		} `json:"config"`
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "provider_config.json"))
+	json.Unmarshal(b, &r)
+	for _, p := range r.Config.ProviderConfigRules.ProviderRules {
+		if _, ok := zcodeKinds[p.Config.API.Type]; ok && p.ProviderID == magpieID {
+			return p.Config.API.Type
+		}
+	}
+	return ""
 }
 
 // onAnotherMachine says base is an http(s) address whose host isn't this
@@ -346,7 +445,7 @@ func zcodeRules(path string, on, keep bool) error {
 		if ids == nil {
 			ids = []string{}
 		}
-		base, token := gateway.URL(), gateway.Token
+		base, token := gateway.URL(), hereKey()
 		if keep {
 			base, token = zcodeKept(filepath.Dir(path))
 		}
@@ -354,7 +453,7 @@ func zcodeRules(path string, on, keep bool) error {
 			"config": map[string]any{
 				"group":            "standard-personal",
 				"access":           map[string]any{"type": "api-key", "apiKey": token},
-				"api":              map[string]any{"type": "anthropic-messages", "baseUrl": base},
+				"api":              map[string]any{"type": zcodeFormat(filepath.Dir(path)), "baseUrl": base},
 				"personalModelIds": ids, "modelOrder": ids,
 			}}
 		// turned off in ZCode, it stays off
@@ -407,3 +506,8 @@ func zcodeNonNil(l []any) []any {
 	}
 	return l
 }
+
+// what zcode says after a change (notice.go)
+var (
+	noticeZcode = newNotice("ZCode reads its providers at start-up — restart ZCode to see magpie's models in its picker.")
+)

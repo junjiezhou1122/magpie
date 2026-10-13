@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,6 +34,11 @@ func TestBusy(t *testing.T) {
 	s := New()
 	gw := httptest.NewServer(s.Handler())
 	defer gw.Close()
+	// deferred after both Closes, so it runs first: each waits for the held
+	// stream (the gateway's request on it), which a failed check would
+	// leave held (#1808)
+	let := sync.OnceFunc(func() { close(release) })
+	defer let()
 	if b := s.Busy(); b.Any() || !b.Last.IsZero() {
 		t.Fatalf("before any request: %+v", b)
 	}
@@ -53,7 +59,7 @@ func TestBusy(t *testing.T) {
 	if b := s.Busy(); b.Requests != 1 || b.Tools != 0 || !b.Any() {
 		t.Fatalf("streaming: %+v, want one request", b)
 	}
-	close(release)
+	let()
 	<-done
 	deadline := time.Now().Add(2 * time.Second)
 	for s.Busy().Requests != 0 && time.Now().Before(deadline) {

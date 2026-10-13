@@ -30,6 +30,17 @@ const row = (i, model, out, ttft) => ({
 const ROWS = [row(0, "glm-fast", 135, 600), row(1, "kimi-slow", 20, 600), row(2, "glm-fast", 135, 600)];
 ROWS.push({ ...row(3, "glm-fast", 135, 0), ttft_ms: undefined, ms: 3000 });
 for (let i = 4; i < 30; i++) ROWS.push(row(i, "glm-fast", 135, 600));
+// one whose content came in a burst (flow_ms, John on Discord: a Kimi Code
+// reply read 1,367 tok/s): its tokens over the wait tell no speed
+ROWS[4].flow_ms = 2;
+// and John's after that fix (Kimi Code: 2,237 tok/s): 550 tokens, 22 of
+// them reasoning, in 16 s from a first content at 5.2 s, the rest let go
+// over 236 ms, its text early or with the burst; then a steady 50 tok/s
+// answer after the same reasoning
+const kimi = { out: 550, reasoning: 22, ms: 16000, ttft_ms: 5200, flow_ms: 236 };
+Object.assign(ROWS[5], kimi, { first_text_ms: 5400 });
+Object.assign(ROWS[6], kimi, { first_text_ms: 15764 });
+Object.assign(ROWS[7], kimi, { out: 552, first_text_ms: 5400, flow_ms: 10600 });
 
 const FAST = { id: "glm-fast", calls: 28, input: 1, output: 3780, cache_read: 0, cache_write: 0, cost: 0.3, timed: 27, ttft_ms: 27 * 600, decode_ms: 27 * 1800, decode_out: 27 * 135 };
 const SLOW = { id: "kimi-slow", calls: 1, input: 1, output: 20, cache_read: 0, cache_write: 0, cost: 0.01, timed: 1, ttft_ms: 600, decode_ms: 2000, decode_out: 20 };
@@ -45,7 +56,11 @@ function ledger(period) {
     by: { model: [FAST, SLOW] }, bucket: "hour",
     series: [
       { label: "", time: hour(1), calls: 14, input: 1, output: 1890, ...{ timed: 14, ttft_ms: 8400, decode_ms: 25200, decode_out: 1890 }, by: { model: { "glm-fast": part({ ...FAST, calls: 14, output: 1890, timed: 14, ttft_ms: 8400, decode_ms: 25200, decode_out: 1890 }) } } },
-      { label: "", time: hour(0), calls: 15, input: 1, output: 1910, ...{ timed: 14, ttft_ms: 8400, decode_ms: 25400, decode_out: 1910 }, by: { model: { "glm-fast": part({ ...FAST, calls: 14, output: 1890, timed: 13, ttft_ms: 7800, decode_ms: 23400, decode_out: 1755 }), "kimi-slow": part(SLOW) } } },
+      // hour(0): the hour's own is 1910 tokens in 27.4 s (69.7 tok/s) while
+      // glm-fast answered 1755 in 23.4 s (75.0), so its mark leaves the column
+      // and gets a leader line; kimi-slow (10) stays under it. hour(1) is the
+      // hour's own equal to the one model that answered in it, so no line
+      { label: "", time: hour(0), calls: 15, input: 1, output: 1910, ...{ timed: 14, ttft_ms: 8400, decode_ms: 27400, decode_out: 1910 }, by: { model: { "glm-fast": part({ ...FAST, calls: 14, output: 1890, timed: 13, ttft_ms: 7800, decode_ms: 23400, decode_out: 1755 }), "kimi-slow": part(SLOW) } } },
     ],
     agents: [{ id: "claude", name: "Claude Code", icon: "claudecode-color" }],
   };
@@ -81,8 +96,8 @@ function server(lang) {
 }
 
 const L = {
-  en: { speed: "Speed", kpi: "Output speed", fast: "75 tok/s", slow: "10 tok/s", all: "72 tok/s", first: "first token in 600 ms on average", sent: "Sent", hint: "Sent, Effort and the cache are in each row's details" },
-  zh: { speed: "速度", kpi: "输出速度", fast: "75 token/秒", slow: "10 token/秒", all: "72 token/秒", first: "首字平均 600 毫秒", sent: "发送模型", hint: "窗口较窄：发送模型、推理强度和缓存在每行的详情里" },
+  en: { speed: "Speed", kpi: "Output speed", fast: "75 tok/s", slow: "10 tok/s", all: "72 tok/s", first: "first token in 600 ms on average · 28 timed replies", sent: "Sent", hint: "Sent, Effort and the cache are in each row's details" },
+  zh: { speed: "速度", kpi: "输出速度", fast: "75 token/秒", slow: "10 token/秒", all: "72 token/秒", first: "首字平均 600 毫秒 · 28 次计时", sent: "发送模型", hint: "窗口较窄：发送模型、推理强度和缓存在每行的详情里" },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
@@ -103,7 +118,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await p.goto("http://magpie.test/");
         assert(await p.evaluate(() => document.body.classList.contains("window")), "the app's window");
         await p.locator('[data-view="usage"]').first().click();
-        await p.locator("#usageTab .opt").nth(1).click();
+        await p.locator(":is(#usageTab .opt, .nav-s):visible").nth(1).click();
         await p.locator("#ledWrap .led tbody tr").first().waitFor();
         await p.waitForTimeout(300);
 
@@ -115,6 +130,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal((await cell(0).textContent()).trim(), w.fast);
         assert.equal((await cell(1).textContent()).trim(), w.slow);
         assert.equal((await cell(3).textContent()).trim(), "—");
+        assert.equal((await cell(4).textContent()).trim(), "—");
+        assert.equal((await cell(5).textContent()).trim(), "—");
+        assert.equal((await cell(6).textContent()).trim(), "—");
+        assert.equal((await cell(7).textContent()).trim(), lang === "en" ? "50 tok/s" : "50 token/秒");
 
         // the table fits the window; what it leaves out is in the details
         const wrap = p.locator("#ledWrap");
@@ -144,6 +163,30 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal((await p.locator("#ledRank .rk").nth(1).locator(".rk-val").textContent()).trim(), w.slow);
         assert.equal(await p.locator("#ledChart rect.col.mark").count(), 3, "a mark for each model at each hour it answered");
         assert.equal(await p.locator("#ledChart rect.col.all").count(), 2, "and the hour's own");
+        // a model faster than the hour's own leaves its mark above the column:
+        // a dotted leader line ties the two, so the mark reads as this hour's
+        // rather than as a stray dash (huoranxuanyuan, #860). The hour(0)
+        // fixture is the one where that happens: 1755 tokens in 23.4 s is
+        // 75.0 tok/s for glm-fast against the hour's own 1910 in 27.4 s,
+        // 69.7, while kimi-slow answers 10
+        const stems = p.locator("#ledChart line.stem");
+        assert.equal(await stems.count(), 1, "a leader line for the mark that leaves its column");
+        const stem = await stems.first().evaluate((l) => ({ x1: l.x1.baseVal.value, x2: l.x2.baseVal.value, y1: l.y1.baseVal.value, y2: l.y2.baseVal.value }));
+        const mark = await p.locator("#ledChart rect.col.mark").nth(1).evaluate((r) => ({ x: r.x.baseVal.value, y: r.y.baseVal.value, w: r.width.baseVal.value, h: r.height.baseVal.value }));
+        const col = await p.locator("#ledChart rect.col.all").nth(1).evaluate((r) => ({ y: r.y.baseVal.value, color: r.dataset.color, style: r.style.fill }));
+        assert(Math.abs(stem.x1 - (mark.x + mark.w / 2)) < 0.51 && Math.abs(stem.x2 - stem.x1) < 0.01, "the line runs down the mark's middle");
+        assert(Math.abs(stem.y1 - col.y) < 0.01, "and starts at its column's top");
+        assert(Math.abs(stem.y2 - (mark.y + mark.h)) < 0.01, "and ends at the mark's foot");
+        assert(stem.y1 > stem.y2, "downward: the mark is above its column");
+        assert.equal(await stems.first().evaluate((l) => getComputedStyle(l).strokeDasharray), "2px, 2px", "dotted");
+        // the column is the track the marks sit on, not the stacked charts'
+        // "Other" grey, and the colour goes through style, where var()
+        // substitutes — not through the attribute, where it does not
+        assert.equal(col.color, "var(--pill)", "the track's colour, named");
+        assert.notEqual(col.style, "", "set through style");
+        const fill = await p.locator("#ledChart rect.col.all").nth(1).evaluate((r) => getComputedStyle(r).fill);
+        assert(fill.startsWith("rgb"), "the style resolves to a colour, not the var() text: " + fill);
+        assert.equal(fill, await p.locator("#ledChart rect.col.all").nth(0).evaluate((r) => getComputedStyle(r).fill), "both hours' tracks read the same");
 
         // a wide window: the Agents and Settings rows don't stretch across it
         await p.setViewportSize({ width: 1670, height: 1060 });

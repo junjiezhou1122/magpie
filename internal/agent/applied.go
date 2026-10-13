@@ -102,6 +102,11 @@ func (a *Agent) Apply(key, v string) error {
 		}
 	}
 	record(a.ID, f.Key, f.Get())
+	// magpie picked in by the user's own hand (magpie model, a pick in
+	// the CLI) connects it again
+	if a.Wired() {
+		forget(a.ID + disconnectedKey)
+	}
 	return nil
 }
 
@@ -113,12 +118,21 @@ type Drift struct {
 	//   "replaced" a magpie model magpie set was replaced by the agent's own;
 	//   "bypassed" the config is right, yet the agent was used since and
 	//              nothing of it reached the gateway — it runs on an old
-	//              config, or something outside the file overrides it.
+	//              config, or something outside the file overrides it;
+	//   "unreachable" the config is right, but the address off loopback
+	//              it names the gateway at doesn't answer (#1013);
+	//   "proxied"  the config is right, but the agent sends its requests
+	//              for the gateway through a proxy (Addr) that doesn't
+	//              pass them on to it (codex_proxy.go).
 	Kind   string `json:"kind"`
 	Field  string `json:"field"`         // the field it shows on
 	Now    string `json:"now,omitempty"` // what that field says now
 	Want   string `json:"want"`          // what setting it again sets
 	Detail string `json:"detail"`        // what exactly is off, for a tooltip
+	// Addr is where an unreachable agent is pointed; Move, when set, the
+	// address WSL reaches Windows at now, which Reapply points it at.
+	Addr string `json:"addr,omitempty"`
+	Move string `json:"move,omitempty"`
 }
 
 // started is when this process — and the gateway in it — came up: before
@@ -162,11 +176,28 @@ func (a *Agent) Drift() *Drift {
 	joined := a.Joined != nil && a.Joined()
 	for _, f := range a.Fields {
 		want, ok := rec.Fields[f.Key]
-		if !ok || joined || vals[f.Key] == want || !magpieValue(a, f, want, vals) || magpieValue(a, f, vals[f.Key], vals) || sameGroup(want, vals[f.Key]) {
+		// a field that reads empty while it follows another (Claude Code's
+		// tiers and subagents on its main model) runs on that one's model:
+		// the main model moved onto the one magpie set the field to reads
+		// as following it, not as the field put back to the agent's own
+		// default (#1050)
+		now := vals[f.Key]
+		if now == "" && f.Follows != "" {
+			now = vals[f.Follows]
+		}
+		if !ok || joined || now == want || !magpieValue(a, f, want, vals) || magpieValue(a, f, now, vals) || sameGroup(want, now) {
 			continue
 		}
 		return &Drift{Kind: "replaced", Field: f.Key, Now: vals[f.Key], Want: want,
 			Detail: a.Name + "'s config was changed outside magpie: " + f.Label + " is " + orDefault(vals[f.Key]) + ", not " + want + " as magpie set it"}
+	}
+	if onMagpie || joined {
+		if d := a.unreachable(on, vals[on.Key]); d != nil {
+			return d
+		}
+		if d := a.proxied(on, vals[on.Key]); d != nil {
+			return d
+		}
 	}
 	if a.Reached != nil && onMagpie {
 		if at, to, refused := a.Reached(rec.At); !at.IsZero() {
@@ -181,7 +212,7 @@ func (a *Agent) Drift() *Drift {
 		}
 	}
 	if a.LastUsed != nil && onMagpie {
-		if used := a.LastUsed(); bypassed(used, rec.At, usage.LastSeen(a.ID)) {
+		if used := a.LastUsed(); bypassed(used, rec.At, lastSeen(a.ID)) {
 			return &Drift{Kind: "bypassed", Field: on.Key, Now: vals[on.Key], Want: vals[on.Key],
 				Detail: a.Name + " was used at " + used.Format("15:04") + " but none of its requests reached magpie — one started before magpie set it up still runs on its old config: restart it"}
 		}
@@ -215,6 +246,11 @@ func (a *Agent) theInstalled() bool {
 // bypassed: the agent was used — while this gateway was up and after magpie
 // last set it — and no request of it arrived since. A request leaves within
 // moments of the prompt; a little grace keeps one in flight from counting.
+// lastSeen is when the agent's last request reached this process's gateway
+// (usage.LastSeen). What usage.Saw records lasts as long as the process, so
+// a test that stands for a request gives its own here.
+var lastSeen = usage.LastSeen
+
 func bypassed(used, applied, seen time.Time) bool {
 	const grace = 30 * time.Second
 	return !used.IsZero() && used.After(started) && used.After(applied) &&
@@ -306,6 +342,9 @@ func (a *Agent) Reapply() error {
 		return a.Native.Connect()
 	}
 	d := a.Drift()
+	if d != nil && d.Kind == "unreachable" && d.Move != "" && a.move != nil {
+		return a.move(d.Addr, d.Move)
+	}
 	if d != nil && d.Kind == "replaced" {
 		rec := appliedOf(a.ID)
 		// the model first: the others (an effort) are checked against it
@@ -323,7 +362,11 @@ func (a *Agent) Reapply() error {
 	}
 	vals := a.Values()
 	for _, f := range a.Fields {
-		if v := vals[f.Key]; v != "" && (d != nil && f.Key == d.Field || magpieValue(a, f, v, vals)) {
+		// magpie as the agent's provider too (Claude Desktop's provider
+		// field, beside its tiers on magpie's models), as Wired takes it:
+		// left out, Reconnect set the tiers again and never the gateway
+		// Check found off (dumplings on Discord)
+		if v := vals[f.Key]; v != "" && (d != nil && f.Key == d.Field || v == magpieID || magpieValue(a, f, v, vals)) {
 			if err := a.Apply(f.Key, v); err != nil {
 				return err
 			}
@@ -447,7 +490,16 @@ func (a *Agent) ConnectHow() (Connection, error) {
 	return a.connect()
 }
 
+// disconnectedKey, after an agent's id, marks in the stash an agent the
+// user disconnected: Disconnect sets it, connecting again takes it out.
+const disconnectedKey = ".disconnected"
+
+// Disconnected reports whether the user disconnected the agent and hasn't
+// connected it since.
+func (a *Agent) Disconnected() bool { return stashLoad()[a.ID+disconnectedKey] == "1" }
+
 func (a *Agent) connect() (Connection, error) {
+	forget(a.ID + disconnectedKey)
 	// what it is on now, for Disconnect to put back what it can't
 	// otherwise (Goose's own model)
 	now := a.Values()
@@ -615,6 +667,10 @@ func (a *Agent) Disconnect() error {
 	if !a.Wired() {
 		return nil
 	}
+	// the user's say, kept till they connect it again: nothing magpie does
+	// by itself (a start's Sync, Codex's account failover) puts magpie back
+	// in, this Disconnect's own writes included (paynezhuang on Discord)
+	stash(map[string]string{a.ID + disconnectedKey: "1"})
 	before, rec := a.Values(), appliedOf(a.ID)
 	if a.Unwire != nil {
 		if err := a.Unwire(); err != nil {
@@ -643,6 +699,11 @@ func (a *Agent) Disconnect() error {
 			if err := f.Set(w); err != nil {
 				return fmt.Errorf("%s: %w", f.Label, err)
 			}
+		}
+	}
+	if a.Restore != nil {
+		if err := a.Restore(); err != nil {
+			return err
 		}
 	}
 	// what it was on through magpie, for switching it on again

@@ -2,11 +2,12 @@ package provider
 
 import (
 	"errors"
-	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
+
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // an ask that couldn't tell leaves the account served, on disk too, where
@@ -14,6 +15,7 @@ import (
 // sure nobody is signed in still signs it out
 func TestCLIIdentityUnsureKeepsAnswer(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	keepIdentities(t)
 	c := &cliIdentity{name: "x", exe: func() string { return "/bin/sh" },
 		ask: func() (string, string, bool, error) { return "me@example.com", "Pro", true, nil }}
 	if _, _, ok := c.get(); !ok {
@@ -97,9 +99,7 @@ func TestAskCursorStatus(t *testing.T) {
 		{"prints no JSON", `echo 'Something went wrong'`, false, "", false},
 		{"fails, token gone", `exit 1`, true, "", true},
 	} {
-		if err := os.WriteFile(exe, []byte("#!/bin/sh\n"+c.script+"\n"), 0o755); err != nil {
-			t.Fatal(err)
-		}
+		testenv.Program(t, exe, "#!/bin/sh\n"+c.script+"\n")
 		signedOut = c.out
 		u, _, ok, err := askCursorStatus()
 		if u != c.user || ok != (c.user != "") || (err == nil) != c.sure {

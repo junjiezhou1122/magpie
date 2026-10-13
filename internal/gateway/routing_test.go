@@ -10,8 +10,12 @@ import (
 )
 
 // Tests don't ask vendors how much of an allowance is used: the gateway
-// would, behind a request, of whatever upstream a test serves.
-func init() { allowances = func(string) map[string]provider.Allowance { return nil } }
+// would, behind a request, of whatever upstream a test serves — nor how
+// much of a key's own windows.
+func init() {
+	allowances = func(string) map[string]provider.Allowance { return nil }
+	keyAllowance = func(provider.Provider) (provider.Allowance, bool) { return nil, false }
+}
 
 func restsOf(cs []candidate) string {
 	s := ""
@@ -22,6 +26,7 @@ func restsOf(cs []candidate) string {
 }
 
 func TestRouting(t *testing.T) {
+	forgetRouting()
 	cs := []candidate{{rest: "r#a"}, {rest: "r#b"}, {rest: "r#c"}}
 	p := provider.Provider{ID: "r"}
 	if got := restsOf(route(p, cs, "m", provider.Chat)); got != "r#a r#b r#c " {
@@ -94,6 +99,7 @@ func TestRoutingKeepsModelAllowancesSeparate(t *testing.T) {
 // Smart routing keeps the first while it has quota to spare, then goes to
 // whichever has the most; a failure rests as long as it says.
 func TestSmartRouting(t *testing.T) {
+	forgetRouting()
 	old := allowances
 	defer func() { allowances = old }()
 	one := func(used float64, resets time.Time) provider.Allowance {
@@ -185,6 +191,14 @@ func TestSmartRouting(t *testing.T) {
 		{429, "You've hit your limit · resets 5pm (Asia/Shanghai)", failQuota},
 		{502, "Claude AI usage limit reached|1790000000", failQuota},
 		{503, `overloaded`, failOther},
+		// a 5xx is the server's, whatever its words, unless the vendor's
+		// quota code says otherwise (#1418)
+		{500, `当前模型 gpt-5.5 负载已经达到上限，请稍后重试 (request id: 20261011161901234567890abcdefgh)`, failOther},
+		{503, `{"error":{"message":"upstream quota service unavailable"}}`, failOther},
+		{500, `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":3600}}`, failQuota},
+		{503, `{"error":{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}}`, failQuota},
+		{403, `今日额度已达上限`, failQuota},
+		{429, `{"error":{"message":"当前分组上游负载已饱和，请稍后再试"}}`, failRate},
 	} {
 		if got := failure(c.status, []byte(c.body)); got != c.want {
 			t.Errorf("%d %s: %s, want %s", c.status, c.body, got, c.want)

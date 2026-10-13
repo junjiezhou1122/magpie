@@ -5,10 +5,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/usage"
 )
 
@@ -128,5 +131,118 @@ func TestCursorLocalConnects(t *testing.T) {
 	KeepCursorLocalEnv(context.Background())
 	if len(set) != 3 {
 		t.Fatalf("set while off: %v", set)
+	}
+}
+
+// Its effort (#1003), which neither its environment nor, for most models,
+// its app can say, is picked in its row among the levels the models it
+// lists have, the default first: kept in magpie for the gateway to ask, and
+// offered only while it is connected and something it lists reasons.
+func TestCursorLocalEffort(t *testing.T) {
+	syncHome(t)
+	oldEnv, oldApp := cursorLocalUserEnv, cursorLocalApp
+	t.Cleanup(func() { cursorLocalUserEnv, cursorLocalApp = oldEnv, oldApp })
+	cursorLocalUserEnv = func(map[string]string) error { return nil }
+	cursorLocalApp = func() string { return "/Applications/Cursor Private Inference.app/Contents/MacOS/Cursor" }
+	if err := provider.Save(provider.Provider{ID: "plain", Name: "Plain", Chat: "https://plain.test/v1", Key: "key", Models: []string{"gpt-4o-mini"}}); err != nil {
+		t.Fatal(err)
+	}
+	a, err := Find(CursorLocalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.ConnectHow(); err != nil || !a.Wired() {
+		t.Fatalf("connect: %v, wired %v", err, a.Wired())
+	}
+	field := func() Field {
+		t.Helper()
+		for _, f := range a.Fields {
+			if f.Key == "effort" {
+				return f
+			}
+		}
+		t.Fatal("no effort field")
+		return Field{}
+	}
+	values := func() []string {
+		var out []string
+		for _, o := range field().Options(a.Values()) {
+			out = append(out, o.Value)
+		}
+		return out
+	}
+	if got := values(); got != nil {
+		t.Fatalf("offered %q with no model that reasons", got)
+	}
+	if err := provider.Save(provider.Provider{ID: "think", Name: "Think", Chat: "https://think.test/v1", Key: "key", Models: []string{"gpt-5.5", "switch-only"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.SaveLive("think", "https://think.test/v1", []catalog.Model{
+		{ID: "gpt-5.5", Efforts: []string{"xhigh", "minimal", "low", "medium", "high", "ultra"}},
+		{ID: "switch-only", Reasoning: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := values(); !slices.Equal(got, []string{"", "minimal", "low", "medium", "high", "xhigh"}) {
+		t.Fatalf("offered %q", got)
+	}
+	// a model that reasons with no levels known: the three every vendor takes
+	if err := provider.SetHiddenModels(CursorLocalID, []string{"think/gpt-5.5"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := values(); !slices.Equal(got, []string{"", "low", "medium", "high"}) {
+		t.Fatalf("with gpt-5.5 hidden, offered %q", got)
+	}
+
+	if err := a.Apply("effort", "high"); err != nil {
+		t.Fatal(err)
+	}
+	if got, kept := a.Values()["effort"], provider.AgentEffort(CursorLocalID); got != "high" || kept != "high" {
+		t.Fatalf("picked high: shown %q, kept %q", got, kept)
+	}
+	if err := field().Set("hard"); err == nil {
+		t.Fatal("a word that isn't a level was kept")
+	}
+	if err := a.Apply("effort", ""); err != nil || provider.AgentEffort(CursorLocalID) != "" {
+		t.Fatalf("back to the default: %v, kept %q", err, provider.AgentEffort(CursorLocalID))
+	}
+
+	// not connected: nothing to pick
+	if err := a.Disconnect(); err != nil {
+		t.Fatal(err)
+	}
+	if got := values(); got != nil {
+		t.Fatalf("offered %q while not connected", got)
+	}
+}
+
+// TestCursorLocalFoundWhereInstalled: the build installed outside the apps
+// folders (a folder picked in its Windows installer, which Windows' list
+// of installed programs names) and its Linux AppImage, as downloaded, are
+// found; regular Cursor's AppImage isn't (#1254).
+func TestCursorLocalFoundWhereInstalled(t *testing.T) {
+	root, elsewhere := t.TempDir(), filepath.Join(t.TempDir(), "D", "Cursor PI")
+	// the Windows install's layout, as its 3.24.9 user setup leaves it
+	res := filepath.Join(elsewhere, "resources", "app")
+	if err := os.MkdirAll(res, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(res, "product.json"), []byte(`{"nameShort":"Cursor Private Inference","nameLong":"Cursor Private Inference","applicationName":"cursor","dataFolderName":".cursor","win32DirName":"cursor"}`), 0o644)
+	os.WriteFile(filepath.Join(elsewhere, "Cursor Private Inference.exe"), nil, 0o755)
+	if got := findCursorLocal([]string{root}); got != "" {
+		t.Fatalf("found %q with nothing in the apps folder", got)
+	}
+	if got := findCursorLocal([]string{root}, filepath.Join(root, "gone"), elsewhere); filepath.Dir(got) != elsewhere {
+		t.Fatalf("installed in a folder of the user's: found %q, want a program in %q", got, elsewhere)
+	}
+
+	os.WriteFile(filepath.Join(root, "Cursor-3.24.9-x86_64.AppImage"), nil, 0o755)
+	if got := findCursorLocal([]string{root}); got != "" {
+		t.Fatalf("regular Cursor's AppImage found as it: %q", got)
+	}
+	img := filepath.Join(root, "Cursor_Private_Inference-3.24.9-x86_64.AppImage")
+	os.WriteFile(img, nil, 0o755)
+	if got := findCursorLocal([]string{root}); got != img {
+		t.Fatalf("its AppImage: found %q, want %q", got, img)
 	}
 }

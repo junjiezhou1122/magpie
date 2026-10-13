@@ -15,6 +15,7 @@ func stubCheckin(t *testing.T, rs []provider.WorkBuddyCheckin) *int {
 	t.Helper()
 	stubTrae(t, nil)
 	stubQoder(t, nil)
+	stubPluginCheckin(t, nil)
 	oldHere, oldHas := checkinHere, hasWorkBuddy
 	t.Cleanup(func() { checkinHere, hasWorkBuddy = oldHere, oldHas })
 	calls := 0
@@ -54,6 +55,21 @@ func stubMiniMax(t *testing.T, rs []provider.WorkBuddyCheckin) *int {
 	return &calls
 }
 
+// stubPluginCheckin stands in for the accounts of plugins that check in
+// themselves (auth.checkin), as stubCheckin does WorkBuddy's.
+func stubPluginCheckin(t *testing.T, rs []provider.WorkBuddyCheckin) *int {
+	t.Helper()
+	oldHere, oldHas := checkinPl, hasPlugin
+	t.Cleanup(func() { checkinPl, hasPlugin = oldHere, oldHas })
+	calls := 0
+	hasPlugin = func() bool { return rs != nil }
+	checkinPl = func(context.Context) []provider.WorkBuddyCheckin {
+		calls++
+		return rs
+	}
+	return &calls
+}
+
 func stubQoder(t *testing.T, rs []provider.WorkBuddyCheckin) *int {
 	t.Helper()
 	oldHere, oldHas := checkinQd, hasQoder
@@ -78,7 +94,7 @@ func TestTUIChecksWorkBuddyIn(t *testing.T) {
 	// nothing signed in: said so, nothing asked
 	calls := stubCheckin(t, nil)
 	m := press(t, usagePage, "c")
-	wantFlash(t, m, false, "no WorkBuddy (China), Trae CN, MiniMax Code or Qoder account is signed in")
+	wantFlash(t, m, false, "no WorkBuddy (China), Trae CN, MiniMax Code, Qoder or check-in plugin account is signed in")
 	if *calls != 0 {
 		t.Fatal("checked in with no account")
 	}
@@ -155,10 +171,11 @@ func TestCheckinOnTheUsageLine(t *testing.T) {
 		{Name: "WorkBuddy", User: "旅行者", Checkins: true, Windows: win, Checkin: &provider.WorkBuddyCheckin{Day: today, Outcome: provider.CheckinClaimed, Credit: 100, Streak: 4}},
 		{Name: "WorkBuddy", User: "second", Checkins: true, Windows: win, Checkin: &provider.WorkBuddyCheckin{Day: "2020-01-01", Outcome: provider.CheckinClaimed}},
 		{Name: "WorkBuddy", User: "third", Checkins: true, Error: "sign-in has expired", Checkin: &provider.WorkBuddyCheckin{Day: today, Outcome: provider.CheckinFailed}},
+		{Name: "WorkBuddy", User: "fourth", Checkins: true, Windows: win, Checkin: &provider.WorkBuddyCheckin{Day: today, Outcome: provider.CheckinOwnApp}},
 		{Name: "Codex", User: "me@example.com", Windows: win},
 	}
 	got := strings.Join(quotaLines(qs, true, false, 200, now), "\n")
-	for _, want := range []string{"签到 ✓ +100 · 4-day streak", "second", "签到 not yet today · c", "sign-in has expired   签到 failed · c tries again"} {
+	for _, want := range []string{"签到 ✓ +100 · 4-day streak", "second", "签到 not yet today · c", "sign-in has expired   签到 failed · c tries again", "签到 only in WorkBuddy's own app · check in there"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in\n%s", want, got)
 		}
@@ -167,5 +184,24 @@ func TestCheckinOnTheUsageLine(t *testing.T) {
 		if strings.Contains(l, "Codex") && strings.Contains(l, "签到") {
 			t.Errorf("a check-in on a Codex line: %s", l)
 		}
+	}
+}
+
+// c checks in the accounts of a plugin that checks in itself (auth.checkin;
+// Lemon on Discord) with the built-ins', named by the plugin's vendor; a
+// captcha is said as such, not as a failure.
+func TestTUIChecksPluginsIn(t *testing.T) {
+	home(t)
+	usagePage := model{w: 200, h: 40, page: pageUsage}
+	stubCheckin(t, nil)
+	calls := stubPluginCheckin(t, []provider.WorkBuddyCheckin{
+		{User: "a@x", By: "plugin:fakeco", Vendor: "FakeCo", Outcome: provider.CheckinClaimed, Credit: 50, Streak: 3},
+		{User: "b@x", By: "plugin:fakeco", Vendor: "FakeCo", Outcome: provider.CheckinCaptcha, Msg: "slide the puzzle"},
+	})
+	m := press(t, usagePage, "c")
+	wantFlash(t, m, true, "FakeCo a@x")
+	wantFlash(t, m, true, "FakeCo b@x asks for a captcha: check in in its own app")
+	if *calls != 1 {
+		t.Fatalf("checked in %d times", *calls)
 	}
 }

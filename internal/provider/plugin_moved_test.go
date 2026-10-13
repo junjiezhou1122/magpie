@@ -3,8 +3,8 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,6 +12,7 @@ import (
 
 	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/settings"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // movedPlugin sets up a built-in moved onto its plugin, id's accounts as
@@ -36,7 +37,9 @@ func movedPlugin(t *testing.T, id string, auths map[string]map[string]any) {
 	write("plugin-auth.json", auths)
 	plugin.UseCached([]plugin.Provider{{ID: id, Spec: spec, Name: strings.ToUpper(id[:1]) + id[1:],
 		Methods: []plugin.Method{{Type: "oauth", Label: "Sign in"}}}})
-	t.Cleanup(func() { plugin.UseCached(nil) })
+	// and a change the test told the plugins' hooks (signing out with no
+	// host) is over before the next test, whose holds it would drop
+	t.Cleanup(func() { plugin.UseCached(nil); plugin.Told() })
 	if err := setMigration(id, func(m *Migration) { m.State, m.Package = MovePlugin, spec }); err != nil {
 		t.Fatal(err)
 	}
@@ -169,10 +172,7 @@ func TestAllLoginsMoved(t *testing.T) {
 // installed first when it isn't there, the code the page asks about shown
 // to copy, and the account it signs in to named as the one in use.
 func TestMovedSignInAsBuiltIn(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	home := claudeHome(t)
 	t.Setenv("MAGPIE_BUN", bun)
 	t.Cleanup(plugin.Settle)
@@ -225,12 +225,19 @@ func TestMovedSignInAsBuiltIn(t *testing.T) {
 		return ""
 	}
 	t.Cleanup(func() { DevinExecutable = oldExe })
-	release := make(chan struct{})
+	// an early failure ends the test with the install still held: the
+	// fake then gives up without touching the test that has gone
+	release, ended := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() { close(ended) })
 	oldRun := runInstaller
 	runInstaller = func(ctx context.Context, c agentCLI) ([]byte, error) {
-		<-release
+		select {
+		case <-release:
+		case <-ended:
+			return nil, errors.New("the test ended")
+		}
 		os.MkdirAll(filepath.Dir(exe), 0o755)
-		return nil, os.WriteFile(exe, []byte("#!/bin/sh\n"), 0o755)
+		return nil, testenv.WriteProgram(exe, "#!/bin/sh\n")
 	}
 	t.Cleanup(func() { runInstaller = oldRun })
 

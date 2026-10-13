@@ -145,26 +145,17 @@ func classify(ask classifier, model string, intents []string, prev before, effor
 	return v, false, nil
 }
 
-var reminders = regexp.MustCompile(`(?s)<system-reminder>.*?</system-reminder>`)
-
-// userText is what the user said to begin the turn: the last user
-// message's text, without what agents add to it for the model
-// (<system-reminder>…), its middle left out when long.
+// userText is what the user said to begin the turn: the words (userSaid)
+// of the last user message that has any — not what agents add to it, or
+// put in after it, for the model (<system-reminder>…, a task
+// notification, an agent list) — its middle left out when long.
 func userText(req *Request) string {
-	var parts []string
-	for i := len(req.Messages) - 1; i >= 0; i-- {
-		m := req.Messages[i]
-		if m.Role != "user" {
-			continue
+	text := ""
+	for i := len(req.Messages) - 1; i >= 0 && text == ""; i-- {
+		if m := req.Messages[i]; m.Role == "user" {
+			text = userSaid(m)
 		}
-		for _, p := range m.Parts {
-			if p.Kind == Text {
-				parts = append(parts, p.Text)
-			}
-		}
-		break
 	}
-	text := strings.TrimSpace(reminders.ReplaceAllString(strings.Join(parts, "\n"), ""))
 	const head, tail = 3000, 1000
 	if r := []rune(text); len(r) > head+tail {
 		text = string(r[:head]) + "\n…\n" + string(r[len(r)-tail:])
@@ -255,6 +246,10 @@ func classifyEffort(model string) string {
 func (s *Server) askClassifier(model string, intents []string, prev before, effort bool, text string) (verdict, error) {
 	if p, m, ok := provider.Resolve(model); ok && p.DecidesModel(m) {
 		return s.askJev(p, m, intents, prev, effort, text)
+	}
+	// a group of decision models: each in turn (decide_group.go)
+	if v, ok, err := s.askDecisionGroup(model, intents, prev, effort, text); ok {
+		return v, err
 	}
 	var v verdict
 	var ierr, eerr error

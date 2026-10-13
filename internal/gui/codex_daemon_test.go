@@ -10,21 +10,22 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // The Restart button runs `codex app-server daemon restart` with the codex
-// magpie finds, for the Codex home it switches; a stand-in codex writes
+// magpie finds, for the Codex home it switches, the user's CODEX_HOME when
+// that is set; a stand-in codex writes
 // down how it was run, since the real one would restart the user's daemon.
 func TestCodexDaemonRestartRoute(t *testing.T) {
-	h := sandboxHome(t)
+	sandboxHome(t)
 	bin := t.TempDir()
 	t.Setenv("PATH", bin)
 	t.Setenv("CODEX_HOME", "/somewhere/else")
 	rec := filepath.Join(bin, "ran")
 	script := "#!/bin/sh\necho \"$@|$CODEX_HOME\" > '" + rec + "'\n[ \"$FAIL\" = 1 ] && { echo 'Error: no daemon' >&2; exit 1; }\nexit 0\n"
-	if err := os.WriteFile(filepath.Join(bin, "codex"), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testenv.Program(t, filepath.Join(bin, "codex"), script)
 	mux := http.NewServeMux()
 	providerRoutes(mux, nil)
 	post := func(action string) *httptest.ResponseRecorder {
@@ -41,7 +42,7 @@ func TestCodexDaemonRestartRoute(t *testing.T) {
 		t.Fatalf("state %v %q", err, st.CodexDaemon)
 	}
 	b, _ := os.ReadFile(rec)
-	if got, want := strings.TrimSpace(string(b)), "app-server daemon restart|"+filepath.Join(h, ".codex"); got != want {
+	if got, want := strings.TrimSpace(string(b)), "app-server daemon restart|/somewhere/else"; got != want {
 		t.Fatalf("ran %q, want %q", got, want)
 	}
 	t.Setenv("FAIL", "1")
@@ -50,6 +51,9 @@ func TestCodexDaemonRestartRoute(t *testing.T) {
 	}
 	if w := post("dismiss"); w.Code != 200 {
 		t.Fatalf("dismiss: %d %s", w.Code, w.Body)
+	}
+	if w := post("dismiss-app"); w.Code != 200 {
+		t.Fatalf("dismiss-app: %d %s", w.Code, w.Body)
 	}
 	if w := post("nope"); w.Code != 404 {
 		t.Fatalf("unknown action: %d", w.Code)

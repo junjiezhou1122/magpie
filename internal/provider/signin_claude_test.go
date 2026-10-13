@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // fakeClaudeAccount is who a fake `claude auth login` signs in to.
@@ -53,6 +55,8 @@ if [ "$1 $2" = "auth status" ]; then
   %s
 fi
 [ "$1 $2" = "auth login" ] || exit 2
+# the proxy it was run with, beside it (#1663)
+printf '%%s' "$HTTPS_PROXY" > "${0%%/*}/login-proxy"
 echo "Opening browser to sign in…"
 "$BROWSER" '%s'
 echo "If the browser didn't open, visit: %s"
@@ -61,6 +65,9 @@ exec 3<&0
 ( while read -r line; do echo "$line" >> "$CLAUDE_CONFIG_DIR/.pasted"; done ) <&3 >/dev/null 2>&1 &
 reader=$!
 while :; do
+  # a test that ended without signing in removed this folder: end, rather
+  # than poll for ever (one did for days after its run)
+  [ -d "${0%%/*}" ] || exit 3
   [ -f '%s' ] && break
   grep -qx 'the-code#st' "$CLAUDE_CONFIG_DIR/.pasted" 2>/dev/null && break
   sleep 0.05
@@ -76,15 +83,13 @@ EOF
 echo '{"loggedIn":true,"email":"%[8]s","subscriptionType":"%[7]s"}' > "$CLAUDE_CONFIG_DIR/status.json"
 echo "Login successful."
 `, own, opened, printed, goFile, a.refresh, time.Now().Add(time.Hour).UnixMilli(), a.plan, a.email, a.orgUUID, a.org, a.name)
-	if err := os.WriteFile(exe, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testenv.Program(t, exe, script)
 	browser := filepath.Join(dir, "browser")
 	body := "#!/bin/sh\nexit 1\n"
 	if opens {
 		body = "#!/bin/sh\nprintf %s \"$1\" > \"$" + openedURLEnv + "\"\n"
 	}
-	os.WriteFile(browser, []byte(body), 0o755)
+	testenv.Program(t, browser, body)
 	oldExe, oldOpener := claudeExecutable, claudeURLOpener
 	claudeExecutable = func() string { return exe }
 	claudeURLOpener = func() string { return browser }
@@ -93,7 +98,44 @@ echo "Login successful."
 		claudeExecutable, claudeURLOpener = oldExe, oldOpener
 		forgetClaudeStatus()
 	})
+	endClaudeSignIns(t)
 	return exe
+}
+
+// endClaudeSignIns makes a Claude sign-in the test started end with it,
+// however the test ends: a test that fails between StartSignIn and the
+// sign-in's end (#1802), or a sign-in that gave up, leaves its `claude auth
+// login` run letting go after the test, and what that run does — add the
+// account, read claudeKeychain, forget the account caches — would land in
+// a later test, whose home and fakes are the ones set by then. It cancels
+// every Claude sign-in still listed, which kills the CLI's process group,
+// and waits for every run to finish. Registered after the test's home and
+// fakes are set, it runs while they are still the test's.
+func endClaudeSignIns(t *testing.T) {
+	t.Helper()
+	t.Cleanup(func() {
+		signIns.Lock()
+		var ids []string
+		for id, s := range signIns.m {
+			if s.status().Agent == "claude" {
+				ids = append(ids, id)
+			}
+		}
+		signIns.Unlock()
+		for _, id := range ids {
+			CancelSignIn(id)
+		}
+		ended := make(chan struct{})
+		go func() {
+			claudeLogins.Wait()
+			close(ended)
+		}()
+		select {
+		case <-ended:
+		case <-time.After(signInDeadline):
+			t.Errorf("a Claude sign-in still ran %s after the test", signInDeadline)
+		}
+	})
 }
 
 // noAnthropic fails the test if anything is asked of claudeBase.

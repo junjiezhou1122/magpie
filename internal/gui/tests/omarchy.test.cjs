@@ -119,13 +119,22 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.locator("#barIconSegs .opt").first().waitFor();
         assert.equal((await page.locator(".om-theme-name").textContent()).trim(), "tokyo-night");
         assert.equal(await page.locator("#themeSegs").isVisible(), false, "the theme is Omarchy's to pick");
-        assert.equal(await page.locator("#langSegs .opt").first().evaluate((b) => getComputedStyle(b).borderTopLeftRadius), "0px", "square");
+        assert.equal(await page.locator("#textSizeSegs .opt").first().evaluate((b) => getComputedStyle(b).borderTopLeftRadius), "0px", "square");
         assert.equal((await page.locator("#barIconRow .name").textContent()).trim(), barName);
 
         // On, then Off: each posted, the pick drawn, the page not moved
         const segs = page.locator("#barIconSegs .opt");
         assert.deepEqual(await segs.allTextContents(), [off, on]);
         assert.equal(await segs.nth(0).evaluate((b) => b.classList.contains("on")), true, "off to start");
+        // Font preferences add rows above the bar control. Bring it into
+        // this short window with a reader's wheel before testing a click.
+        await page.locator("#view-settings").hover();
+        await page.mouse.wheel(0, 260);
+        await page.waitForFunction(() => {
+          const r = document.querySelector("#barIconSegs").getBoundingClientRect();
+          const v = document.querySelector("#view-settings").getBoundingClientRect();
+          return r.top >= v.top && r.bottom <= v.bottom;
+        });
         const before = await view(page);
         await segs.nth(1).click();
         await page.locator("#barIconSegs .opt.on", { hasText: on }).waitFor();
@@ -147,7 +156,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.route("**/*", server(lang, theme, { available: false, on: false }, asked, posted));
         await page.goto("http://magpie.test/");
         await page.locator("#prefs").click();
-        await page.locator("#langSegs .opt").first().waitFor();
+        await page.locator("#langPick span").first().waitFor();
         await page.waitForTimeout(300);
         assert(asked.includes("GET /api/omarchy/widget"));
         assert.equal(await page.locator("#barIconRow").isVisible(), false);

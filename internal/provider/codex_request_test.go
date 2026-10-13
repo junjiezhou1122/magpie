@@ -12,6 +12,60 @@ import (
 	"github.com/yetone/magpie/internal/codexcat"
 )
 
+// The conversation goes in the session headers Codex CLI 0.162 sends,
+// session-id and thread-id, by which the ChatGPT backend finds its cached
+// prompt; the body's prompt_cache_key alone left a request with tools
+// uncached (#1473). Older Codex's underscored names don't go on, relayed
+// or not, and a request without a key keeps the session its client named.
+func TestCodexSignSessionHeaders(t *testing.T) {
+	signIn(t)
+	p, _ := find(All(), "codex")
+	req, _ := http.NewRequest("POST", p.Responses+"/responses", nil)
+	req.Header.Set("session_id", "relayed")
+	req.Header.Set("conversation_id", "relayed")
+	if err := p.Sign(context.Background(), req, Responses, []byte(`{"prompt_cache_key":"thread-1"}`)); err != nil {
+		t.Fatal(err)
+	}
+	h := req.Header
+	if h.Get("session-id") != "thread-1" || h.Get("thread-id") != "thread-1" {
+		t.Fatalf("session-id %q thread-id %q, want thread-1: %v", h.Get("session-id"), h.Get("thread-id"), h)
+	}
+	for k := range h {
+		if strings.Contains(k, "_") {
+			t.Errorf("header %s: %v", k, h)
+		}
+	}
+
+	// a body without a key (no user message yet): the client's own session
+	req, _ = http.NewRequest("POST", p.Responses+"/responses", nil)
+	req.Header.Set("session-id", "codex-thread")
+	req.Header.Set("thread-id", "codex-thread")
+	if err := p.Sign(context.Background(), req, Responses, []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if req.Header.Get("session-id") != "codex-thread" || req.Header.Get("thread-id") != "codex-thread" {
+		t.Fatalf("keyless request lost its session: %v", req.Header)
+	}
+
+	// a client that names none: each turn of a conversation gets the
+	// same session, from how it starts
+	turn := func(input string) string {
+		req, _ := http.NewRequest("POST", p.Responses+"/responses", nil)
+		body := p.Prepare([]byte(`{"model":"gpt-5.5","instructions":"You are omp.","tools":[{"type":"function","name":"read","parameters":{"type":"object"}}],"input":[` + input + `]}`))
+		if err := p.Sign(context.Background(), req, Responses, body); err != nil {
+			t.Fatal(err)
+		}
+		return req.Header.Get("session-id")
+	}
+	user := `{"type":"message","role":"user","content":[{"type":"input_text","text":"fix the bug"}]}`
+	first := turn(user)
+	next := turn(user + `,{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]},` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"and the test?"}]}`)
+	if first == "" || first != next {
+		t.Fatalf("sessions %q and %q", first, next)
+	}
+}
+
 func TestCodexSignAndBody(t *testing.T) {
 	signIn(t)
 	p, _ := find(All(), "codex")
@@ -22,7 +76,7 @@ func TestCodexSignAndBody(t *testing.T) {
 	h := req.Header
 	if !strings.HasPrefix(h.Get("Authorization"), "Bearer h.") || h.Get("chatgpt-account-id") != "acct-1" ||
 		h.Get("originator") != "codex_cli_rs" || !strings.HasPrefix(h.Get("User-Agent"), "codex_cli_rs/0.") ||
-		h.Get("OpenAI-Beta") != "responses=experimental" || h.Get("session_id") != "thread-1" || h.Get("conversation_id") != "thread-1" {
+		h.Get("OpenAI-Beta") != "responses=experimental" || h.Get("session-id") != "thread-1" || h.Get("thread-id") != "thread-1" {
 		t.Fatalf("headers: %v", h)
 	}
 	out := p.Prepare([]byte(`{"model":"gpt-5.5","input":"hi","max_output_tokens":5,"temperature":0.1,"stream":false,"store":true,"reasoning":{"effort":"low"}}`))
@@ -181,8 +235,8 @@ func TestCodexPromptsSameMtime(t *testing.T) {
 	}
 }
 
-// Codex's Fast mode reaches the ChatGPT backend as service_tier "priority";
-// any other tier is dropped as before.
+// Codex's Fast mode reaches the ChatGPT backend as service_tier "priority",
+// its Ultrafast as "ultrafast"; any other tier is dropped as before.
 func TestCodexBodyServiceTier(t *testing.T) {
 	t.Setenv("CODEX_HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
@@ -194,6 +248,9 @@ func TestCodexBodyServiceTier(t *testing.T) {
 	}
 	if v, _ := tier(`{"model":"gpt-6-sol","service_tier":"priority","input":"hi"}`); v != "priority" {
 		t.Errorf("priority: %v", v)
+	}
+	if v, _ := tier(`{"model":"gpt-6-sol","service_tier":"ultrafast","input":"hi"}`); v != "ultrafast" {
+		t.Errorf("ultrafast: %v", v)
 	}
 	for _, s := range []string{`"flex"`, `"auto"`, `"default"`, `"fast"`, `null`} {
 		if v, ok := tier(`{"model":"gpt-6-sol","service_tier":` + s + `,"input":"hi"}`); ok {
@@ -224,5 +281,73 @@ func TestCodexStandaloneNotifications(t *testing.T) {
 				t.Fatalf("standalone changed: %s -> %s", b, a)
 			}
 		}
+	}
+}
+
+// A replayed web search goes with the web_search tool declared where the
+// request carries its tools (#1270): in the tools, or for Codex's Responses
+// Lite in an additional_tools item, which the backend wants there; a
+// request that offered no tools still calls none, and one that chose a
+// tool keeps its choice.
+func TestDeclareSearch(t *testing.T) {
+	t.Setenv("CODEX_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	const search = `{"type":"web_search_call","status":"completed","action":{"type":"search","query":"go release"}}`
+	const user = `{"type":"message","role":"user","content":[{"type":"input_text","text":"go on"}]}`
+	type sent struct {
+		Input []struct {
+			Type  string           `json:"type"`
+			Tools []map[string]any `json:"tools"`
+		} `json:"input"`
+		Tools      []map[string]any `json:"tools"`
+		ToolChoice any              `json:"tool_choice"`
+	}
+	types := func(ts []map[string]any) string {
+		var out []string
+		for _, t := range ts {
+			out = append(out, t["type"].(string))
+		}
+		return strings.Join(out, ",")
+	}
+	for _, c := range []struct {
+		name, body          string
+		lite                bool
+		tools, extra, first string
+		choice              any
+	}{
+		{"Lite on an account: into its additional_tools", `{"model":"gpt-6.1-sol","parallel_tool_calls":false,"reasoning":{"effort":"low","context":"all_turns"},"input":[{"type":"additional_tools","role":"developer","tools":[{"type":"namespace","name":"functions","tools":[]}]},` + search + `,` + user + `]}`, false, "", "namespace,web_search", "additional_tools", "auto"},
+		{"Lite with no tools item: one first", `{"model":"gpt-6.1-sol","parallel_tool_calls":false,"reasoning":{"effort":"low","context":"all_turns"},"input":[` + search + `,{"type":"compaction_trigger"}]}`, false, "", "web_search", "additional_tools", "none"},
+		{"declared already", `{"model":"gpt-5.5","tools":[{"type":"web_search_preview"}],"input":[` + search + `]}`, false, "web_search_preview", "", "web_search_call", "auto"},
+		{"declared in additional_tools", `{"model":"gpt-5.5","input":[{"type":"additional_tools","tools":[{"type":"web_search"}]},` + search + `]}`, false, "", "web_search", "additional_tools", "auto"},
+	} {
+		var got sent
+		if err := json.Unmarshal(codexBody([]byte(c.body)), &got); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		var extra []map[string]any
+		for _, it := range got.Input {
+			extra = append(extra, it.Tools...)
+		}
+		if types(got.Tools) != c.tools || types(extra) != c.extra || got.Input[0].Type != c.first || got.ToolChoice != c.choice {
+			t.Errorf("%s: tools %q, additional %q, first %s, tool_choice %v", c.name, types(got.Tools), types(extra), got.Input[0].Type, got.ToolChoice)
+		}
+	}
+
+	// a choice of a tool stays; tools that aren't a list are left alone
+	for in, want := range map[string]string{
+		`{"tools":[],"tool_choice":"required","input":[` + search + `]}`:              `"tool_choice":"required"`,
+		`{"tool_choice":{"type":"function","name":"shell"},"input":[` + search + `]}`: `"tool_choice":{"name":"shell","type":"function"}`,
+		`{"tools":{},"input":[` + search + `]}`:                                       `"tools":{}`,
+		`{"tools":[],"input":[` + user + `]}`:                                         `"tools":[]`,
+	} {
+		if out := string(DeclareSearch([]byte(in), false)); !strings.Contains(out, want) {
+			t.Errorf("%s:\n%s", in, out)
+		}
+	}
+	// Codex's Lite header names a request Lite without anything in it
+	var lite sent
+	json.Unmarshal(DeclareSearch([]byte(`{"input":[`+search+`]}`), true), &lite)
+	if len(lite.Tools) != 0 || lite.Input[0].Type != "additional_tools" || types(lite.Input[0].Tools) != "web_search" || lite.ToolChoice != "none" {
+		t.Errorf("Lite: %+v", lite)
 	}
 }

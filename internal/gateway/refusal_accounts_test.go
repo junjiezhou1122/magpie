@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/testenv"
 	"github.com/yetone/magpie/internal/usage"
 )
 
@@ -255,7 +256,7 @@ while read -r line; do
     echo '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}'
     echo '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}}'
     echo '{"type":"stream_event","event":{"type":"content_block_stop","index":0}}'
-    echo '{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":2}}}'
+    echo '{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber","explanation":null}},"usage":{"output_tokens":2}}}'
     echo '{"type":"stream_event","event":{"type":"message_stop"}}'
     echo '{"type":"result","subtype":"success","is_error":true,"result":"API Error: Claude Code is unable to respond to this request, which appears to violate our Usage Policy"}'
   else
@@ -267,7 +268,7 @@ while read -r line; do
   fi
 done
 `
-	os.WriteFile(filepath.Join(dir, "claude"), []byte(script), 0o755)
+	testenv.Program(t, filepath.Join(dir, "claude"), script)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	provider.ForgetAccounts()
 	t.Cleanup(provider.ForgetAccounts)
@@ -286,6 +287,10 @@ done
 		r := lastRoute(s)
 		if len(r.Tries) != 2 || r.Tries[0].Fail != failRefused || r.Tries[0].Rest != nil || r.Tries[1].Status != 200 {
 			t.Fatalf("%s: tries: %+v", ask.path, r.Tries)
+		}
+		// the classifier's category, on the try it refused (#1768)
+		if ask.path == "/v1/messages" && !strings.Contains(r.Tries[0].Error, "category cyber") {
+			t.Errorf("%s: refused try says %q", ask.path, r.Tries[0].Error)
 		}
 	}
 }

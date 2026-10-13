@@ -15,7 +15,8 @@ func Stored() ([]Provider, error) {
 }
 
 // Restore puts providers from a backup in. Each replaces the one here with
-// its id; one that came without keys keeps the keys already here. It
+// its id; one that came without keys keeps the keys already here, and
+// one without an access key or balance token keeps those (KeepSecrets). It
 // returns how many were new and how many replaced one here.
 func Restore(ps []Provider) (added, replaced int, err error) {
 	f, err := read()
@@ -39,13 +40,7 @@ func Restore(ps []Provider) (added, replaced int, err error) {
 			added++
 			continue
 		}
-		if p.Key == "" && len(p.Keys) == 0 {
-			p.Key, p.KeyName, p.Keys, p.KeyProtocol, p.KeyWeight = f.Providers[i].Key, f.Providers[i].KeyName, f.Providers[i].Keys, f.Providers[i].KeyProtocol, f.Providers[i].KeyWeight
-			if p.BalanceToken == "" {
-				p.BalanceToken = f.Providers[i].BalanceToken
-			}
-		}
-		f.Providers[i] = p
+		f.Providers[i] = KeepSecrets(p, f.Providers[i], p.Key == "" && len(p.Keys) == 0)
 		replaced++
 	}
 	if added+replaced == 0 {
@@ -87,7 +82,8 @@ func RestoreGroups(gs []Group) error {
 
 // Mirror makes the providers and groups exactly these, as sync brings them
 // from another computer: one not among them goes, one that came without
-// keys keeps the keys it has here.
+// keys keeps the keys it has here, and an access key or balance token it
+// came without is kept too (KeepSecrets).
 func Mirror(ps []Provider, gs []Group) error {
 	f, err := read()
 	if err != nil {
@@ -103,11 +99,8 @@ func Mirror(ps []Provider, gs []Group) error {
 		if p.ID == "" || p.ID != Slug(p.ID) || p.ID == "magpie" {
 			continue
 		}
-		if h, ok := here[p.ID]; ok && p.Key == "" && len(p.Keys) == 0 {
-			p.Key, p.KeyName, p.Keys, p.KeyProtocol, p.KeyWeight = h.Key, h.KeyName, h.Keys, h.KeyProtocol, h.KeyWeight
-			if p.BalanceToken == "" {
-				p.BalanceToken = h.BalanceToken
-			}
+		if h, ok := here[p.ID]; ok {
+			p = KeepSecrets(p, h, p.Key == "" && len(p.Keys) == 0)
 		}
 		out = append(out, p)
 	}

@@ -100,14 +100,14 @@ function server(lang, theme, asked) {
 
 const L = {
   en: {
-    tabs: ["Overview", "Requests", "Sessions"],
+    tabs: ["Overview", "Requests", "Sessions", "Context"],
     cols: ["Time", "Agent", "Requested", "Provider · account", "Sent", "Served", "Effort", "In", "Out", "Cache write", "Cache read", "Cost", "Duration", "Speed", "Status"],
     sum: "130 requests", pager: "1–100 of 130", older: "Older", newer: "Newer", failed: "Failed", export: "Export CSV",
     why: "The vendor was asked for gpt-6-sol, but its reply says gpt-6-luna answered",saved: "Saved 130 requests to ~/Downloads/magpie-requests-30d-2026-09-29.csv",
     none: "No requests match these filters.", bad: "Failed: the agent was answered 429", via: "Codex · via office-mac",
   },
   zh: {
-    tabs: ["概览", "请求", "会话"],
+    tabs: ["概览", "请求", "会话", "上下文"],
     cols: ["时间", "Agent", "请求模型", "供应商 · 账号", "发送模型", "实际模型", "推理强度", "输入", "输出", "缓存写入", "缓存读取", "费用", "耗时", "速度", "状态"],
     sum: "130 个请求", pager: "第 1–100 条，共 130 条", older: "较早", newer: "较新", failed: "失败", export: "导出 CSV",
     why: null, saved: "已将 130 个请求保存到 ~/Downloads/magpie-requests-30d-2026-09-29.csv",
@@ -145,7 +145,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.route("**/*", server(lang, theme, asked));
       await page.goto("http://magpie.test/");
       await page.locator('nav [data-view="usage"], [data-view="usage"]').first().click();
-      await page.locator("#usageTab .opt").nth(1).click();
+      await page.locator(":is(#usageTab .opt, .nav-s):visible").nth(1).click();
       await page.locator("#ledWrap .led tbody tr").first().waitFor();
       return { page, errors };
     };
@@ -219,7 +219,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await t.test(lang, async () => {
         const asked = [];
         const { page, errors } = await open(lang, "light", asked);
-        assert.deepEqual(await page.locator("#usageTab .opt").allTextContents(), w.tabs);
+        assert.deepEqual(await page.locator(":is(#usageTab .opt, .nav-s):visible").allTextContents(), w.tabs);
         assert.equal(asked.at(-1).get("period"), "today");
         assert.equal(asked.at(-1).get("offset"), "0");
         assert.deepEqual(await page.locator(".led thead th").allTextContents(), w.cols);
@@ -446,7 +446,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         if (shots) await page.screenshot({ path: path.join(shots, `${engine}-usage-ledger-${lang}-narrow-dark.png`) });
         // nor with the tab bar's other tabs, now three
         for (const i of [0, 2]) {
-          await page.locator("#usageTab .opt").nth(i).click();
+          await page.locator(":is(#usageTab .opt, .nav-s):visible").nth(i).click();
           await page.waitForTimeout(300);
           const [wider, wide] = await sideways();
           assert(!wider && !wide.length, `tab ${i}: the page does not scroll sideways: ${wide}`);

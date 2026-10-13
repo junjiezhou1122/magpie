@@ -24,6 +24,7 @@ import (
 	"unicode/utf16"
 
 	"github.com/yetone/magpie/internal/proc"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // A Tool is a command of a WSL distro's own.
@@ -32,7 +33,8 @@ type Tool struct {
 	Path   string // the command, inside the distro
 	PATH   string // the distro's PATH it was found on, which it may need (node)
 	Mount  string // where Windows' drives are mounted: "/mnt/"
-	Host   string // the Windows host's address inside the distro, "" when it is 127.0.0.1 (mirrored networking)
+	Host   string // the Windows host's address inside the distro, "" when it is 127.0.0.1 (HostLoopback)
+	Root   bool   // the distro's default user, as whom the command runs, is root
 }
 
 // On is whether there is WSL to look in: on Windows, or in tests.
@@ -58,10 +60,11 @@ var found struct {
 const findAge = time.Minute
 
 // Find is the command name of a running WSL distro's own, the default
-// distro first. ok is false off Windows, without WSL, or when no running
-// distro has it.
+// distro first. ok is false off Windows, without WSL, with Settings'
+// Detect agents in WSL off, or when no running distro has it.
 func Find(name string) (Tool, bool) {
-	if !On {
+	// Settings' Detect agents in WSL, off, looks in no distro (#1264)
+	if !On || settings.Load().NoWSLAgents {
 		return Tool{}, false
 	}
 	found.Lock()
@@ -172,8 +175,8 @@ func Forget() {
 // probeScript prints where name is in the distro, with the PATH it is on,
 // from a login shell, then an interactive one (nvm's node is put on PATH
 // by .bashrc), then where Claude Code's installer puts it; and where
-// Windows' drives are mounted, the default route (the Windows host under
-// NAT) and WSL's networking mode.
+// Windows' drives are mounted, whether its user is root, the default route
+// (the Windows host under NAT) and WSL's networking mode.
 func probeScript(name string) string {
 	return `for p in "$(command -v ` + name + ` 2>/dev/null)" ` +
 		`"$(bash -ic 'command -v ` + name + `' 2>/dev/null </dev/null | tail -n1)" ` +
@@ -181,7 +184,7 @@ func probeScript(name string) string {
 		`case "$p" in /mnt/*|"") continue;; esac; ` +
 		`[ -x "$p" ] && { echo "bin:$p"; ` +
 		`echo "path:$(bash -ic 'echo $PATH' 2>/dev/null </dev/null | tail -n1)"; echo "lpath:$PATH"; break; }; done; ` +
-		`echo "mount:$(wslpath -u 'C:\' 2>/dev/null)"; ` +
+		`echo "mount:$(wslpath -u 'C:\' 2>/dev/null)"; echo "uid:$(id -u)"; ` +
 		`ip route show default 2>/dev/null | head -n1 | sed 's/^/route:/'; ` +
 		`command -v wslinfo >/dev/null 2>&1 && echo "net:$(wslinfo --networking-mode 2>/dev/null)"; true`
 }
@@ -213,6 +216,8 @@ func parseProbe(distro, out string) (Tool, bool) {
 			}
 		case "net":
 			net_ = strings.ToLower(v)
+		case "uid":
+			t.Root = v == "0"
 		}
 	}
 	if !strings.HasPrefix(t.Path, "/") {
@@ -228,10 +233,27 @@ func parseProbe(distro, out string) (Tool, bool) {
 	if dir := t.Path[:strings.LastIndex(t.Path, "/")]; dir != "" && !onPath(t.PATH, dir) {
 		t.PATH = dir + ":" + t.PATH
 	}
-	if net_ == "mirrored" {
+	if HostLoopback(net_) {
 		t.Host = ""
 	}
 	return t, true
+}
+
+// HostLoopback reports whether 127.0.0.1 inside a WSL 2 distro reaches
+// Windows' own 127.0.0.1 in networking mode, as wslinfo --networking-mode
+// prints it: mirrored, and consomme (WSL 2.9's name for what was
+// virtioproxy), whose user-mode stack relays the distro's 127.0.0.1 to
+// Windows' while localhostForwarding is on, as it is unless .wslconfig
+// turns it off (microsoft/WSL's ConsommeTests::LoopbackGuestToHost). Its
+// default route there is Windows' own next hop (198.18.0.2 under a TUN
+// proxy, #1230), never Windows. Under nat, bridged or none, and for a mode
+// not known (""), 127.0.0.1 is the distro's own.
+func HostLoopback(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "mirrored", "consomme", "virtioproxy":
+		return true
+	}
+	return false
 }
 
 func onPath(path, dir string) bool {

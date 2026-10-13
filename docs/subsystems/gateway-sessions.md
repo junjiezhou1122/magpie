@@ -1,0 +1,334 @@
+# Gateway Session Aggregation
+
+The Sessions API combines file-backed native sessions with a read-only
+projection of gateway usage records. A gateway session identity is exactly
+`AgentOf(record.Agent) + record.Session`, where the session is the one the
+client sent (`X-Magpie-Session`, or its own session header), whatever it starts
+with. The response returns that id in `X-Magpie-Session`; listed browser
+origins can read this header through CORS. magpie never makes up an id for a
+request without one, so such a request has no session and its text is not
+recorded: text kept under an id nothing lists couldn't be opened. Prompt text,
+caller keys and network addresses are never used to guess conversation ownership.
+So the configs magpie writes have each agent name its session: Pi's provider
+block sets `compat.sendSessionAffinityHeaders` (`x-session-affinity` on Chat and
+Messages; Responses sends `session_id` anyway), and omp 16.0.6 and later gets
+`compat.promptCacheSessionHeader: x-session-affinity`. A user's own
+`sendSessionAffinityHeaders` is kept (`piBlockKept`). Verification:
+`TestPiNamesItsSessionToTheGateway`, `TestOmpNamesItsSessionToTheGateway`.
+Older ledger records without `Session` remain excluded. The projection is
+computed from the usage ledger and is not persisted. Window projections and
+routing summaries reuse versioned log snapshots; appends and rewrites invalidate
+them, and price/provider changes also invalidate priced projections. Single-session
+lookups use the cached identity index. Native exclusions are applied per caller.
+
+When the same identity is present in a native session, the native session wins
+and the gateway projection is omitted. Gateway projections have no path,
+resume command or terminal action: the agent's own files of them are not on
+this computer. Their rows carry `gateway: true`; the Sessions page groups them
+under "Seen through the gateway" rather than "No folder", and their size is the
+text magpie recorded of them (`sessions.GatewaySizes`), shown only when there
+is some. Their
+models, token totals, start/last timestamps and effective prices come from the
+same usage records used by Usage and stats endpoints.
+
+Claude Desktop gateway rows can have a local name even without a CLI
+transcript (#1675). [`DesktopTitles`](../../internal/sessions/desktop_titles.go)
+reads `claude-code-sessions/*/*/local_*.json` and
+`local-agent-mode-sessions/*/*/local_*.json` in Desktop's data folders
+(`DesktopDataDirs`, the same `desktopdir.Everywhere` the session readers use,
+Claude-3p and Windows' MSIX folders included). The record's `title` names the
+CLI ids Desktop's own LocalSessionManager counts as the session's: its live
+handles `cliSessionId` and `unarchivedCliSessionId`, its lineage
+`preClearCliSessionId` and `priorCliSessionIds`, and, with no `cliSessionId`,
+its `sessionId` without `local_`. Prior runs share the current name but remain
+separate usage identities. A live handle takes precedence over a lineage one,
+and conflicting names at the same rank are unknown. A record that is there but
+doesn't read or parse (Desktop midway through writing it) keeps its last
+parse; one gone takes its names with it; with none, the row keeps the recorded
+first-prompt title or its id. Files are read through `filememo`, and the names
+stand for a second (`desktopTitlesHeld`) before the files are looked at again,
+so a list that assembles hundreds of native Desktop sessions stats them once
+and a rename in Desktop shows within a second. The names reach the native
+Desktop sessions (`assemble`), every gateway list (`MergeExternal`), the stats
+summaries (`MergeExternalStats`), Routing's `/api/gateway/session-titles`
+(`Titles`) and the Context page. It does not grant resume or native transcript
+capabilities to a gateway row. Verification: `TestDesktopSessionTitles`,
+`TestDesktopSessionTitleIdentity`, `TestDesktopSessionTitleHandles`,
+`TestDesktopSessionTitleInStats`, `TestDesktopTitlesReadOncePerList`,
+`TestDesktopSessionTitlesOnPages`.
+
+A gateway projection can be deleted (lc on Discord). `sessions.DeleteGateway`
+moves its recorded text folders (`gateway-conversations/<date>/<identity hash>`)
+into magpie's session trash under `trash/sessions/gateway/`, with a note
+marked `gateway`, and adds `{agent, id, last}` to
+`gateway-sessions-hidden.json` in the config directory. `/api/sessions` and
+`/api/sessions/manage` leave out a hidden session up to that last request; a
+newer request lists it again. The usage ledger is not changed, so Usage,
+`/api/sessions/one` and the stats endpoints keep what it spent. A session with
+a request in the last minute is refused as active. Restore moves the text back
+(items that expired or were cleared meanwhile are skipped; a session recorded
+again on the same day is refused rather than overwritten) and unhides it; it
+accepts only items that are that session's identity folders in the store.
+Delete forever keeps it hidden. The recording's promises hold in the trash:
+the hourly cleanup erases trashed gateway text past the seven days, "Delete
+saved conversations…" erases it too (the notes stay, so Restore can still
+list the session), and `HasGatewayConversations` counts it.
+Implementation: [`internal/sessions/gateway_delete.go`](../../internal/sessions/gateway_delete.go),
+`Restore` in [`internal/sessions/manage.go`](../../internal/sessions/manage.go), and
+[`internal/gui/sessions_manage.go`](../../internal/gui/sessions_manage.go).
+All-time statistics include gateway history older than native files. Calendar
+activity and output totals use each session's actual request dates, including
+intermediate dates; extending the range rebases existing native calendar indices.
+
+Implementation: [`internal/usage/gateway_sessions.go`](../../internal/usage/gateway_sessions.go),
+[`internal/sessions/external.go`](../../internal/sessions/external.go), and
+[`internal/gui/sessions.go`](../../internal/gui/sessions.go).
+
+## Local Gateway Conversation Recording
+
+The Sessions page offers an explicit, default-off recording switch. Confirmation
+discloses that prompts, replies and tool results can contain private files and
+code. The switch is a card above the session list that says what is kept and
+where (this computer only, up to 7 days and 256 MiB). It shows only where it
+applies: on an agent whose list has gateway sessions (`gateway` on a
+`/api/sessions/manage` row), in gateway mode, or while recording is on or text
+is kept. Its "Delete saved conversations…" shows while
+`/api/sessions/manage`'s `recorded` says some text is kept
+(`sessions.HasGatewayConversations`, true when the folder can't be read), and
+asks in magpie's own dialog first. `Settings.GatewayConversations` is machine-local consent:
+`settings.SetGatewayConversations` updates it under the settings file lock.
+Other Settings saves retain the latest stored consent under that lock, so an
+older snapshot cannot re-enable recording after it is stopped. `KeepOwn`
+also prevents sync/restore from enabling it.
+`POST /api/sessions/recording` changes this switch; `clear: true` disables it and
+erases only locally recorded gateway content (the store and deleted sessions'
+text in the trash), leaving usage and native files.
+The existing browser-mode authentication guard protects these APIs; this is an
+administrator view, not per-caller-key access control.
+
+[`recordConversation`](../../internal/gateway/conversations.go) wraps
+`serveAgent` outside protocol translation and gateway middleware. It records
+one client-facing exchange, not each retry, only under the session the client
+named, using the same `usage.AgentOf` identity as the usage projection, so
+every recorded conversation has a Sessions row that opens it. Codex's direct `/backend-api/codex/responses` relay is captured too.
+Internal helper calls, token counting, embeddings, model listings, and compaction
+paths that do not pass through these entry points are not recorded.
+Recording adds no header and changes none, so routing and prompt-cache
+affinity see the request as the client sent it. The existing protocol
+readers handle Chat, Anthropic, Responses and Gemini; streaming replies use the
+existing decoders, with completed Responses items retaining custom tool calls.
+Only content actually sent through the gateway is available. Images are shown
+as placeholders; hidden reasoning, client-only operations and unsupported wire
+items cannot be reconstructed. This is not a raw request archive or remote
+session synchronization, and existing S3 archives are not imported.
+
+[`SaveGatewayTurn`](../../internal/sessions/gateway.go) stores normalized,
+scrubbed exchanges in one append-only `turns.jsonl` per
+`gateway-conversations/<UTC date>/<identity hash>/` under
+the Magpie config directory, using 0700 directories and 0600 files. Each line is
+one bounded turn; legacy per-turn JSON files remain readable until they expire.
+An incomplete final append is omitted from reads (marked truncated) and removed
+before the next append; complete earlier lines remain available. No headers are
+stored. Known secrets and secret-named JSON
+fields are scrubbed, but arbitrary sensitive text is not guaranteed removable.
+Response capture uses an 8 MiB temporary spool; input is bounded to 8 MiB too.
+Normalized turns are bounded to 1 MiB on disk, individual parts to 64 KiB,
+and each daily session file to 256 MiB. A full daily session file rejects further
+recording that day. Hourly background cleanup removes expired buckets and the
+oldest files above 256 MiB; this is a soft store limit between cleanup passes.
+Saving a turn does not rescan the whole store, and background traversal and
+sorting do not hold the save lock.
+Capture, parsing or persistence failure does not change the model response;
+filesystem failures are logged without conversation bodies.
+
+Content older than seven days is excluded from reads. The serving gateway
+cleans up expired UTC-day buckets at startup and hourly, including with recording
+off; the daily layout means physical cleanup can lag the read cutoff by one day.
+Disable-and-clear and writes share a lock and recheck the consent generation,
+preventing an in-flight request from refilling a cleared store even if recording
+is enabled again before that request completes.
+
+`GET /api/sessions/transcript` still prefers a matching native session. Otherwise
+it reads a known gateway session's last 128 retained exchanges. A full exact
+previous-history prefix is omitted from the next request, while repeated new
+messages are preserved. System/tool-definition context is separately collapsed
+when unchanged. Compacted, edited or incremental contexts may repeat material;
+they are never guessed into a single canonical history. The existing transcript
+display bounds apply and truncation is marked. Empty/expired/missing content
+has an explicit empty state and all gateway transcripts identify their source.
+The page invalidates pending transcript reads on reload or clear. A completed
+read updates the current open transcript after redraw, and an older response
+cannot replace content fetched after clearing the store.
+
+`GET /api/sessions/markdown` and `POST /api/sessions/export` take the same
+choice: a native session is written from its file (`sessions.WriteMarkdown`),
+and otherwise a known gateway session from what its transcript reads
+(`sessions.WriteGatewayMarkdown`, "Recorded by: magpie's gateway", with a note
+when turns or a part's end weren't kept). A magpie that others reach as a
+remote magpie has no file of their agents' sessions, so this is the only way
+it can export them. Verification: `TestGatewaySessionExportsMarkdown`.
+
+A gateway session without a saved Desktop name is titled by what it was
+first asked (YOU on Discord), not its `ses_…` id: `sessions.GatewayTitle` reads the first 8 complete turns of
+the oldest recorded file of it in the 7 days kept, takes the first user text
+part that isn't a `<…>` context tag, `# AGENTS.md` or an image, and makes it one
+line (`untagged`). A finished file's answer is cached by path; a growing
+`turns.jsonl` with no title yet is read again. With nothing recorded at all
+(the store's folder missing) it costs one stat. `gatewayListed` applies it in
+every list (`/api/sessions`, `/manage`, `/one`, the stats summaries); a session
+with no saved Desktop name or recorded text keeps its id as title.
+
+`GET /api/sessions/search?agent=&q=` finds an agent's sessions by what was said
+in them, for the Sessions page's filter. The query is lowered and its spaces
+made one (`sessions.NeedleOf`); under 2 runes it searches nothing. Native
+sessions of an agent whose files are read (`HasTranscript`) are read from their
+own file (`SearchSession`), first through a byte prefilter (`mayHold`: the
+query's longest word, ASCII case folded without a copy, in 1 MiB chunks;
+skipped for zstd files, for queries JSON may escape, and for a session whose
+path isn't the file its conversation is in, `linesFile`: an OpenCode session's
+info file or database, a Cursor chat's SQLite store, whose newest pages sit in
+its `-wal`; `search_db_test.go`), then decoded only to
+the first match in what the user or the model said. Of a Claude or Codex file
+only the lines holding every word of the query are decoded (`readTranscriptOf`,
+a part being one line's); Pi's tree is read whole. Without that, one 1.3 GB
+Claude session took the whole 8 seconds; with it, all 58 of the owner's (3 GB)
+are searched in 3–7 s on a loaded machine. Gateway sessions, and the native sessions of an agent whose files aren't
+read (then `unread: true`), are searched in their recorded transcript
+(`SearchGateway`). System prompts, tool definitions (`role: system`, `kind:
+context`) and images are never matched. Sessions are read newest first by 4
+workers at most, stopping at 200 hits or 8 seconds (`cut: true`, with
+`searched` of `total`); the request's context cancels the read, so the page's
+next query ends the last one. Each hit carries the match with up to 36 runes
+before and 120 after, cut ends marked "…". The page waits 300 ms after the
+last keystroke, aborts the request in flight, shows a title, folder, id or
+model match at once, adds the sessions the search found with their snippet
+(the match in a `<mark>`, built as text nodes), and says when it is
+searching, cut short or limited to recorded text.
+Implementation: [`internal/sessions/search.go`](../../internal/sessions/search.go),
+`searchSessions` in [`internal/gui/sessions_manage.go`](../../internal/gui/sessions_manage.go),
+[`internal/gui/assets/sessions.js`](../../internal/gui/assets/sessions.js).
+Verification: `TestSearchSession*` (`TestSearchSessionReadsOnlyLinesWithTheWords`
+for the line filter), `TestContainsFold`, `TestMayHoldSkipsAFileWithoutTheWords`,
+`TestGatewayTitleAndSearch`, `TestSessionsSearch*`; browser
+`sessions-search.test.cjs`.
+
+Verification: `TestGatewayConversation*` (`TestGatewayConversationNeedsTheClientsSession`
+and `TestGatewayConversationClientRequestPrefixedSession` for the two rules above), `TestGatewaySessionHistoryAndCalendar`,
+`TestGatewaySessionsNativeWinsBeforeLimits`,
+`TestGatewayStatsRebaseNativeCalendar`, `TestCORSKeyThroughTheServer`,
+`TestSessionsDeleteGatewaySession`, `TestGatewayDeleteTrashExpires`, `TestGatewayPurgeKeepsItHidden`, `TestGatewayDeleteNothingRecorded` and
+`TestGatewayRestoreRefusesForeignItems`; browser
+`gateway-conversations.test.cjs`, `sessions-talk.test.cjs`,
+`sessions-gateway-delete.test.cjs`, and locale checks.
+
+## Usage over the gateway, and subagents
+
+`GET /v1/magpie/usage` and `GET /v1/magpie/usage/requests`
+([`internal/gateway/usage_api.go`](../../internal/gateway/usage_api.go)) serve
+the Usage page's summary and request ledger from the same builders as the
+window's `/api/usage` and `/api/usage/requests`
+([`internal/usageapi`](../../internal/usageapi/usageapi.go)), read-only and
+without conversation text. They follow `/v1/magpie/quotas`' guard: this
+machine, or another with an enabled gateway key, behind the same Host check.
+A key that is held (`heldKey`: a budget, models or accounts) is refused the
+summary and gets the ledger filtered to its own `CallerKey`, with its filter
+lists cut to its own rows (`usageapi.OwnPage`): the ledger's facets are drawn
+from every call in the period, so without the cut they would name other keys.
+`TestUsageOverGateway` covers both, and a red when either cut is removed.
+
+### Calls read from the agents' own files
+
+A call an agent made without magpie reaches Usage only when its own files
+are read (`sessions.Calls`, from `callSources` in
+[`calls.go`](../../internal/sessions/calls.go)). The readers are Claude
+Code's, Claude Desktop's and Cowork's, Codex's (and both in WSL), and,
+read a file at a time (`wholeCallReaders` in
+[`call_cache.go`](../../internal/sessions/call_cache.go)), OpenCode's
+(#680), ZCode's, DeepSeek Harness's (`dsh`), WorkBuddy's, CodeBuddy
+Code's (#1779), MiniMax Code's (#1605) and Kimi Code's (#1607,
+[`calls_kimi.go`](../../internal/sessions/calls_kimi.go)). Each skips the
+calls the agent made through magpie's own entry, which the gateway logged
+with the account that answered: Kimi Code's are the ones whose
+`usage.record` model begins `magpie/`. Kimi Code's calls are its
+`usage.record`s in every agent's `wire.jsonl` under
+`$KIMI_CODE_HOME/sessions` (else `~/.kimi-code`), protocols 1.4 and 1.5;
+a fork repeats its parent's records, so each is keyed by agent, time,
+model and usage and counted once. The other agents the Sessions page reads
+(pi, Cline, Qoder, Grok, Droid, omp, Cursor, Hermes, Alma) have no reader
+yet (#1607). Verification: `TestMiniMaxCodeCalls`, `TestKimiCode*` (the
+reporter's real wire files), `TestCodeBuddyCalls`, `TestWorkBuddyCalls*`.
+
+### Calls an app reports itself
+
+`POST /v1/magpie/usage/requests`
+([`internal/gateway/usage_ingest.go`](../../internal/gateway/usage_ingest.go),
+#1874) takes calls that never went through magpie, from an app that sends
+them straight to its vendor, so the Usage page covers them too. The body is
+one record or an array of up to 5000 (32 MiB at most), in `usage.jsonl`'s
+shape: `t`, `agent`, `provider`, `model` and `rid` are required; `in`,
+`out`, `cache_read`, `cache_write`, `cache_write_1h`, `reasoning`, `ms`,
+`ttft_ms`, `status`, `cost`, `effort`, `session` and `err` are optional.
+Any other field, a quoted number, a negative or out-of-range count, a time
+more than an hour ahead or before 2000-01-01T00:00:00Z refuses the whole
+post with a 400 that names the record (`error.index`) and the field
+(`error.param`), and nothing is written. A past `t` is taken as given,
+however old, so a client's history can be backfilled.
+
+- **Who may post:** the GET routes' rule, through the same `lanGuard`:
+  this machine, or another with an enabled gateway key while shared. On
+  top of that a browser page (`fromBrowser`) needs a key wherever it is,
+  since `corsGuard` lets a localhost page and `Origin: null` through, and
+  a held key is refused. `TestUsageIngestAccess`.
+- **Writing:** `usage.IngestReported`
+  ([`internal/usage/reported.go`](../../internal/usage/reported.go))
+  appends under the same mutex and to the same file as `usage.Append`,
+  each row with `source: "reported"` and no caller key. A `rid` the log
+  already has as reported, or one repeated in the post, is skipped. The
+  set of reported rids is read from the log itself, so it survives a
+  restart: the first post after one scans the log once, keeping only
+  lines that carry the reported mark, and each later post reads only what
+  was appended since. The reply counts `accepted` and `skipped` and gives
+  each record's `index`, `rid` and `status`, so a re-run of a batch is
+  safe.
+- **Pricing:** a record with `cost` keeps it (`Record.OwnCost`, the
+  `rowOwnCost` flag on a packed row). Without one it is priced at magpie's
+  own prices, like a gateway row.
+- **Showing:** reported rows count in every total. They also have a source
+  of their own (`SourceReported`): `RequestPage.Reported`, `?via=reported`,
+  and a fourth cell and a "Reported" badge on the Requests tab.
+- **Nothing live:** a reported row only shows on the Usage page.
+  `Record.IsReported` keeps it out of a gateway key's budget and spend
+  limit (`budget.counts`), a subscription window's holds (and the log's
+  start that decides whether a window can be reckoned, `firstOwn`), the
+  Sessions page's gateway sessions, what a session was routed to (`Vias`),
+  and Codex's sealed answers and remembered model. Nothing else is done
+  for it: no OTel span, no rate limit, no rest, no alert.
+
+`TestUsageIngest*` and `TestIngestReported*` cover these, including
+concurrent posts beside the gateway's own writes, and a backfill of a full
+5000-record batch landing on the right 7d/30d/all days.
+`TestReportedTouchesNothingLive` and `TestUsageIngestTouchesNoLimit` go red
+when any of the live guards is removed. Browser:
+`usage-ledger-reported.test.cjs`.
+
+With 200k reported rows (a 47 MB log), 40 posts of 5000 took 0.4 s in all.
+The first post after a restart took 0.45 s to read the rids back, and a
+later one about 2 ms. The Usage page's first read builds the log index
+(2.1 s, as it does for the gateway's own rows); after that, a page of all
+took 27 ms and the all-time summary 215 ms.
+
+A usage record's `Session` stays the conversation. A Claude Code subagent's
+record adds `Subagent` and `ParentAgent`. Through the gateway they come from
+the `x-claude-code-agent-id` and `x-claude-code-parent-agent-id` headers
+Claude Code sends for a subagent's requests (`subagentOf`, read in
+`appendUsage`); the main thread sends neither. A row read from the agent's own
+files gets `Subagent` from the file's name, `<session>/subagents/agent-<id>.jsonl`
+or `<session>/subagents/workflows/<run>/agent-<id>.jsonl`
+(`sessions.SubagentOf`), so no cache version changes, and `ParentAgent` from
+the `parentAgentId` of the `agent-<id>.meta.json` beside it, which Claude Code
+writes for a subagent a subagent started (`sessions.SubagentParent`, read once
+a file; a meta file not read is unknown and read again). A gateway row matched
+to a file row keeps the gateway's own. Both were checked against Claude Code
+2.1.296 spawning a subagent from a subagent.
+Codex sub-agents are told apart by `Kind` (`x-openai-subagent`) only: no
+spawned Codex thread was found on disk to take a parent's shape from.

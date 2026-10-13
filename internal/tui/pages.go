@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -130,6 +131,11 @@ func (m model) updateProviders(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.flash, m.flashOK = p.Name+" is a signed-in account: its key is the agent's sign-in", false
 			return m, nil
 		}
+		if p.IsVertex() {
+			// its token is minted from the user's Google credentials
+			m.flash, m.flashOK = p.Name+" takes no key · magpie provider set "+p.ID+" credentials=… impersonate=… changes its Google credentials", false
+			return m, nil
+		}
 		in := newInput("the API key")
 		in.EchoMode = textinput.EchoPassword
 		in.EchoCharacter = '•'
@@ -139,6 +145,10 @@ func (m model) updateProviders(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return saveProvider(p.ID, func(p *provider.Provider) { p.Key = v; provider.ForgetBalances() }, p.Name+" key "+provider.Mask(v))
 			}})
 	case "w":
+		if p.IsVertex() {
+			m.flash, m.flashOK = p.Name+" is asked at your Google Cloud project · magpie provider set "+p.ID+" project=… location=… changes it", false
+			return m, nil
+		}
 		pr := provider.Preset(p.Preset)
 		if pr == nil || pr.Endpoint == "" {
 			m.flash, m.flashOK = p.Name+" is asked at its vendor's address · magpie provider set "+p.ID+" url=… changes a custom one's", false
@@ -188,7 +198,7 @@ func (m model) updateProviders(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.flash, m.flashOK = "testing "+p.Name+"…", true
 		return m, testCmd(p)
 	case "m":
-		// the vendor's list asked again, as the app editor's Refresh does
+		// the vendor's list asked again, as the app editor's Fetch models does
 		m.flash, m.flashOK = "asking "+p.Name+" for its models…", true
 		return m, refetchCmd(p.ID)
 	case "d":
@@ -240,7 +250,7 @@ func saveProvider(id string, change func(*provider.Provider), done string) tea.C
 
 // refetchCmd asks the provider's vendor for its model list again and says
 // how many it has and how many agents are offered, or why there is none:
-// the app editor's Refresh, which the TUI had no way to do (akic404 on
+// the app editor's Fetch models, which the TUI had no way to do (akic404 on
 // Discord: a provider added here had 0 models and nothing to fetch them).
 func refetchCmd(id string) tea.Cmd {
 	return func() tea.Msg {
@@ -360,13 +370,14 @@ func (m *model) openProviderModels(id string) {
 		crumbs: []string{"providers", p.Name, "models"},
 		input:  newInput("filter models"),
 		items:  modelOptions(id),
+		relist: func() []agent.Option { return modelOptions(id) },
 		empty:  "no models known yet · m on the providers list asks the vendor for them",
 		toggle: func(model string) ([]agent.Option, string, bool) {
 			p, err := provider.Find(id)
 			if err != nil {
 				return nil, err.Error(), false
 			}
-			ids := p.Models
+			ids := p.Picks()
 			if len(ids) == 0 {
 				for _, x := range p.Exposed() {
 					ids = append(ids, x.ID)
@@ -399,21 +410,50 @@ func (m *model) openProviderModels(id string) {
 	m.mode = modePick
 }
 
-// openPresets picks a vendor magpie knows, then asks for its key.
+// kindNote is what a preset is, beside its name in the add list: another
+// computer's magpie is said to be one, not filed under the relays (Avalon
+// on Discord didn't find it there).
+func kindNote(k provider.Kind) string {
+	if k == provider.KindRemote {
+		return "another computer's magpie, shared on its network"
+	}
+	return string(k)
+}
+
+// openPresets picks a vendor magpie knows, then asks for its key, or for
+// Google Vertex AI the project it takes in place of one.
 func (m *model) openPresets() {
 	var items []agent.Option
+	var shown []string
+	for _, d := range provider.Partners() {
+		items = append(items, agent.Option{Value: d.ID, Note: d.Name + " · partner (sponsor)"})
+		shown = append(shown, d.ID)
+	}
+	go func() {
+		provider.CountPartner(provider.PartnerShown, shown...)
+		provider.NoticePartners(shown...)
+	}()
 	for _, d := range provider.Presets() {
-		items = append(items, agent.Option{Value: d.ID, Note: d.Name + " · " + string(d.Kind)})
+		items = append(items, agent.Option{Value: d.ID, Note: d.Name + " · " + kindNote(d.Kind)})
+	}
+	for _, c := range customAPIs {
+		items = append(items, agent.Option{Value: c.id, Note: "your own · " + c.name + " API, at its address"})
 	}
 	m.pk = picker{
 		crumbs: []string{"providers", "add"},
-		input:  newInput("a vendor magpie knows (magpie provider add <name> url=… for another)"),
+		input:  newInput("a vendor magpie knows, or custom for your own API"),
 		items:  items,
 		onPick: func(id string) tea.Cmd {
+			if i := slices.IndexFunc(customAPIs, func(c customAPI) bool { return c.id == id }); i >= 0 {
+				return func() tea.Msg { return askMsg{customURLAsk(customAPIs[i])} }
+			}
 			return func() tea.Msg {
 				p, err := provider.FromPreset(id)
 				if err != nil {
 					return flashMsg{text: err.Error()}
+				}
+				if p.IsVertex() {
+					return askMsg{vertexProjectAsk(p)}
 				}
 				// a vendor reached at the user's own address (a remote
 				// magpie, Azure OpenAI) has none of the preset's: it is
@@ -434,6 +474,52 @@ func (m *model) openPresets() {
 	m.mode = modePick
 }
 
+// customAPI is an API a provider of the user's own is asked on, as the
+// app's custom provider editor names it, and magpie provider add's url=,
+// responses=, anthropic= and gemini= set it.
+type customAPI struct {
+	id, name, example string
+	set               func(p *provider.Provider, url string)
+}
+
+// customAPIs are what a custom provider is added as from the TUI, which
+// had vendors magpie knows alone (hezz1891 on Discord: a server's TUI had
+// no way to add one's own relay).
+var customAPIs = []customAPI{
+	{"custom-openai", "OpenAI compatible (Chat Completions)", "https://api.example.com/v1", func(p *provider.Provider, u string) { p.Chat = u }},
+	{"custom-responses", "OpenAI Responses", "https://api.example.com/v1", func(p *provider.Provider, u string) { p.Responses = u }},
+	{"custom-anthropic", "Anthropic compatible (Messages)", "https://api.example.com", func(p *provider.Provider, u string) { p.Anthropic = u }},
+	{"custom-gemini", "Gemini compatible", "https://api.example.com/v1beta", func(p *provider.Provider, u string) { p.Gemini = u }},
+}
+
+// customURLAsk asks for the base URL of a provider of the user's own on
+// api, then its name and its key, and adds it.
+func customURLAsk(api customAPI) ask {
+	return ask{crumbs: []string{"providers", "add", "custom", "base URL"}, input: newInput(api.example),
+		hint: api.name + " · the base URL, e.g. " + api.example, empty: true,
+		onEnter: func(v string) tea.Cmd {
+			return func() tea.Msg {
+				u, err := url.Parse(v)
+				if v == "" || err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+					return flashMsg{text: "the base URL is an http:// or https:// address, e.g. " + api.example}
+				}
+				in := newInput(u.Hostname())
+				return askMsg{ask{crumbs: []string{"providers", "add", "custom", "name"}, input: in,
+					hint: "its name in magpie · enter for " + u.Hostname(), empty: true,
+					onEnter: func(name string) tea.Cmd {
+						return func() tea.Msg {
+							if name == "" {
+								name = u.Hostname()
+							}
+							p := provider.Provider{Name: name}
+							api.set(&p, strings.TrimRight(v, "/"))
+							return askMsg{addKeyAsk(p)}
+						}
+					}}}
+			}
+		}}
+}
+
 // addKeyAsk asks for the key of p, a preset's provider, and adds it.
 func addKeyAsk(p provider.Provider) ask {
 	in := newInput("the API key")
@@ -445,33 +531,54 @@ func addKeyAsk(p provider.Provider) ask {
 	}
 	return ask{crumbs: []string{"providers", "add", p.Name}, input: in, hint: hint, empty: true,
 		onEnter: func(key string) tea.Cmd {
-			return func() tea.Msg {
-				p.Key = key
-				id, err := provider.Add(p)
-				if err != nil {
-					return flashMsg{text: err.Error()}
-				}
-				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-				defer cancel()
-				saved, err := provider.Find(id)
-				if err != nil {
-					return flashMsg{text: err.Error()}
-				}
-				// the vendor's list, and what came of asking it: a list
-				// that failed said so, not an "added" over 0 models
-				// (akic404 on Discord)
-				text := "added " + saved.Name
-				ms, err := saved.Fetch(ctx)
-				if err != nil && saved.Decides() {
-					// a System One API: its list isn't what it is for
-					return flashMsg{text: text, ok: true}
-				}
-				if err != nil {
-					return flashMsg{text: text + " · " + fetchNote(err)}
-				}
-				return flashMsg{text: text + " · " + modelsNote(id, len(ms)), ok: len(ms) > 0}
-			}
+			p.Key = key
+			return addCmd(p)
 		}}
+}
+
+// vertexProjectAsk asks for the Google Cloud project of p, a Google Vertex
+// AI provider, and adds it there. It takes no key: its requests are signed
+// with the user's Google credentials, whose file and service account are
+// set from the CLI, as its location is. Nothing typed is said to be needed,
+// as Save says it.
+func vertexProjectAsk(p provider.Provider) ask {
+	return ask{crumbs: []string{"providers", "add", p.Name, "project"}, input: newInput("your Google Cloud project's id"), empty: true,
+		hint: "no key: signed with gcloud's Application Default Credentials (gcloud auth application-default login)\n" +
+			"magpie provider set " + provider.FreeID(p.ID) + " location=… credentials=… impersonate=… changes the rest",
+		onEnter: func(project string) tea.Cmd {
+			p.Vertex = &provider.Vertex{Project: project}
+			return addCmd(p)
+		}}
+}
+
+// addCmd adds p, a preset's provider, and says what came of asking its
+// vendor for its models.
+func addCmd(p provider.Provider) tea.Cmd {
+	return func() tea.Msg {
+		id, err := provider.Add(p)
+		if err != nil {
+			return flashMsg{text: err.Error()}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		saved, err := provider.Find(id)
+		if err != nil {
+			return flashMsg{text: err.Error()}
+		}
+		// the vendor's list, and what came of asking it: a list that
+		// failed said so, not an "added" over 0 models (akic404 on
+		// Discord)
+		text := "added " + saved.Name
+		ms, err := saved.Fetch(ctx)
+		if err != nil && saved.DecideOnly() {
+			// a System One API: its list isn't what it is for
+			return flashMsg{text: text, ok: true}
+		}
+		if err != nil {
+			return flashMsg{text: text + " · " + fetchNote(err)}
+		}
+		return flashMsg{text: text + " · " + modelsNote(id, len(ms)), ok: len(ms) > 0}
+	}
 }
 
 // endpointAsk asks for the address of a vendor reached at the user's own
@@ -524,6 +631,15 @@ func (m model) viewProviders() string {
 			r.key = "○ switched off"
 		case p.Account != nil:
 			r.key = "● " + p.Account.User
+		case p.IsVertex() && !p.Ready():
+			r.key = "○ needs a project"
+		case p.IsVertex():
+			// no key: a token minted from the user's Google credentials,
+			// as magpie providers says it
+			r.key = "● Google credentials"
+			if p.Vertex != nil && p.Vertex.Impersonate != "" {
+				r.key += " as " + p.Vertex.Impersonate
+			}
 		case p.Key != "":
 			r.key = "● " + provider.Mask(p.Key)
 		case p.Ready():
@@ -593,7 +709,7 @@ type quotaMsg []provider.SubscriptionQuota
 
 func quotasCmd() tea.Msg {
 	provider.AskClaudeUsage() // the page opened, or r pressed
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	ctx, cancel := context.WithTimeout(provider.Asked(context.Background()), 12*time.Second)
 	defer cancel()
 	// a WorkBuddy (China) account's line says how its daily check-in went,
 	// as its card in the app does
@@ -616,6 +732,8 @@ var (
 	hasMiniMax   = provider.HasMiniMax
 	checkinQd    = provider.CheckInQoder
 	hasQoder     = provider.HasQoder
+	checkinPl    = func(ctx context.Context) []provider.WorkBuddyCheckin { return provider.CheckInPlugins(ctx) }
+	hasPlugin    = provider.HasPluginCheckin
 )
 
 // checkinCmd presses WorkBuddy's daily check-in (签到) now for every
@@ -624,7 +742,8 @@ var (
 // the built-in's or the plugin's (akic404 on Discord: the TUI had no way
 // to); and Trae CN's (每日签到) for each Trae CN account (#694), and
 // MiniMax Code's for each MiniMax Code account (#811), and Qoder's daily
-// credits for each Qoder account. It says
+// credits for each Qoder account, and each plugin's own check-in
+// (auth.checkin) for its accounts. It says
 // how each account stands: the credits and streak, in
 // already today, or why not. A shared magpie's accounts are checked in
 // on that magpie, from its own app, TUI or CLI.
@@ -665,8 +784,16 @@ func checkinCmd() tea.Msg {
 			parts = append(parts, checkinWords(r))
 		}
 	}
+	if hasPlugin() {
+		for _, r := range checkinPl(ctx) {
+			if r.Outcome == provider.CheckinFailed {
+				failed++
+			}
+			parts = append(parts, checkinWords(r))
+		}
+	}
 	if len(parts) == 0 {
-		return checkinMsg{text: "no WorkBuddy (China), Trae CN, MiniMax Code or Qoder account is signed in · only they have the daily check-in"}
+		return checkinMsg{text: "no WorkBuddy (China), Trae CN, MiniMax Code, Qoder or check-in plugin account is signed in · only they have the daily check-in"}
 	}
 	return checkinMsg{text: strings.Join(parts, "; "), ok: failed == 0}
 }
@@ -687,6 +814,8 @@ func checkinWords(r provider.WorkBuddyCheckin) string {
 		who = "Qoder"
 	case r.By == "qoder":
 		who = "Qoder " + who
+	case r.Vendor != "":
+		who = strings.TrimSpace(r.Vendor + " " + who)
 	case who == "":
 		who = "WorkBuddy"
 	}
@@ -707,12 +836,36 @@ func checkinWords(r provider.WorkBuddyCheckin) string {
 		return who + " isn't eligible for the check-in"
 	case provider.CheckinInactive:
 		return who + ": no check-in event now"
+	case provider.CheckinCaptcha:
+		return who + " asks for a captcha: check in in its own app"
+	case provider.CheckinOwnApp:
+		return who + ": " + ownAppWords(r)
 	}
 	msg := r.Msg
 	if msg == "" {
 		msg = "no answer"
 	}
 	return who + " couldn't check in: " + msg
+}
+
+// ownAppName is the vendor whose own app alone gets r's check-in credits.
+func ownAppName(r provider.WorkBuddyCheckin) string {
+	switch {
+	case r.By == "trae":
+		return "Trae CN"
+	case r.Vendor != "":
+		return r.Vendor
+	case r.By == "":
+		return "WorkBuddy"
+	}
+	return "the vendor"
+}
+
+// ownAppWords says a check-in the vendor pays only to its own app
+// (Trae CN's 9074, #808) is to be done in that app.
+func ownAppWords(r provider.WorkBuddyCheckin) string {
+	name := ownAppName(r)
+	return name + " only gives check-in credits to its own app; check in in the " + name + " app"
 }
 
 // checkinCell is a WorkBuddy (China) or Trae CN account's check-in on its
@@ -740,6 +893,10 @@ func checkinCell(q provider.SubscriptionQuota, now time.Time) string {
 		return sMuted.Render("签到 not eligible")
 	case provider.CheckinInactive:
 		return sMuted.Render("签到 no event now")
+	case provider.CheckinCaptcha:
+		return sMuted.Render("签到 needs a captcha · check in in its app")
+	case provider.CheckinOwnApp:
+		return sMuted.Render("签到 only in " + ownAppName(*r) + "'s own app · check in there")
 	}
 	return sBad.Render("签到 failed") + sMuted.Render(" · c tries again")
 }
@@ -769,7 +926,7 @@ func (m model) updateUsage(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	default:
 		return m, nil
 	}
-	m.sum, m.direct = usage.Summarize(m.period), usage.Direct(m.period)
+	m.sum, m.direct = usage.Summaries(m.period)
 	return m, nil
 }
 
@@ -883,8 +1040,14 @@ func (m model) viewUsage() string {
 // tables, the gateway's or the agents' own calls.
 func (m model) usageBlock(b *strings.Builder, s usage.Summary, room int, names map[string]string) {
 	line := sName.Render(fmtTokens(s.Tokens())+" tokens") + sMuted.Render(fmt.Sprintf(" · %d call%s · ", s.Calls, plural(s.Calls))) + sOK.Render(fmtCost(s.Totals))
+	if s.Unpriced > 0 { // calls with no known price, not in the cost (#1856)
+		line += sMuted.Render(fmt.Sprintf(" (%d call%s unpriced)", s.Unpriced, plural(s.Unpriced)))
+	}
 	if s.Errors > 0 {
 		line += sMuted.Render(" · ") + sBad.Render(fmt.Sprintf("%d error%s", s.Errors, plural(s.Errors)))
+	}
+	if s.Retried > 0 { // answered after a try that failed first, not an error
+		line += sMuted.Render(fmt.Sprintf(" · %d answered on a retry", s.Retried))
 	}
 	b.WriteString(pad + "  " + line + "\n")
 	b.WriteString(pad + "  " + sMuted.Render("in "+fmtTokens(s.Input)+"  out "+fmtTokens(s.Output)+"  cache read "+fmtTokens(s.CacheRead)+"  cache write "+fmtTokens(s.CacheWrite)+"  reasoning "+fmtTokens(s.Reasoning)) + "\n\n")

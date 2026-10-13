@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -167,5 +168,32 @@ func TestDroidGrokInstructions(t *testing.T) {
 		if s := read(t, f); s != "# Mine\n\n"+blockBegin+"\nUse tabs.\n"+blockEnd+"\n" {
 			t.Errorf("%s's AGENTS.md:\n%s", id, s)
 		}
+	}
+}
+
+// Grok App's independent home (Use on a custom provider) reads AGENTS.md
+// and skills beside agent-home/config.toml, not Grok Build's ~/.grok.
+func TestGrokAppInstructions(t *testing.T) {
+	h := sandbox(t)
+	root := filepath.Join(h, "grok-app-data")
+	t.Setenv("GROK_APP_HOME", root)
+	home := filepath.Join(root, "agent-home")
+	write(t, filepath.Join(home, "config.toml"), "[models]\ndefault = \"deepseek\"\n")
+	inst := filepath.Join(home, "AGENTS.md")
+	write(t, inst, "# Mine\n")
+	tg := targetByID("grok-app")
+	if tg == nil || tg.Instructions != inst || tg.Skills != filepath.Join(home, "skills") || tg.MCP == nil || tg.MCP.Path != filepath.Join(home, "config.toml") {
+		t.Fatalf("Grok App library places: %+v", tg)
+	}
+	if !slices.Contains(readsShared, "grok-app") {
+		t.Fatal("Grok App doesn't read ~/.agents/skills")
+	}
+	shared := "Use tabs."
+	ok(t)(SaveInstructions(InstructionsChange{Shared: &shared, Agents: []string{"grok-app"}}))
+	if s := read(t, inst); s != "# Mine\n\n"+blockBegin+"\nUse tabs.\n"+blockEnd+"\n" {
+		t.Fatalf("AGENTS.md:\n%s", s)
+	}
+	if cfg := read(t, filepath.Join(home, "config.toml")); !strings.Contains(cfg, `default = "deepseek"`) {
+		t.Fatalf("instructions rewrote the route:\n%s", cfg)
 	}
 }

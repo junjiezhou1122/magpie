@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"mime"
 	"mime/multipart"
@@ -38,7 +39,9 @@ import (
 // DrawAgent is the User-Agent magpie's generate_image tool adds to its own.
 const DrawAgent = "magpie-image/1"
 
-const drawTimeout = 5 * time.Minute
+// drawTimeout is how long a vendor is given to draw: to answer, and to send
+// all of its answer.
+var drawTimeout = 5 * time.Minute
 
 // maxDrawings is how many images one request may ask for.
 const maxDrawings = 4
@@ -52,13 +55,26 @@ func drawer() (string, bool) {
 		return "", false
 	case "":
 	default:
-		if _, _, ok := provider.Resolve(v); ok {
+		if pickedMissing(v) == "" {
 			return v, true
 		}
 	}
 	m := AutoDrawer()
 	return m, m != ""
 }
+
+// Drawer is the model a request that names none draws with (drawer), as
+// provider/model: "" when image generation is off or no provider draws.
+func Drawer() string {
+	m, _ := drawer()
+	return m
+}
+
+// DrawerMissing is the model Settings › Models › Image generation names
+// when magpie can't find it any more, so that AutoDrawer's draws in its
+// place, as VisionMissing is Image recognition's. "" when none is named,
+// it is off, or it resolves.
+func DrawerMissing() string { return pickedMissing(settings.Load().ImageGen) }
 
 func resolveDrawing(id string) (provider.Provider, string, bool) {
 	if strings.Contains(id, "/") {
@@ -74,15 +90,69 @@ func resolveDrawing(id string) (provider.Provider, string, bool) {
 			}
 		}
 	}
+	// a subscription's newer image model, named before magpie lists it
+	// (grok-imagine-image-2.0, #1857): its vendor draws it, or says why not
+	for _, p := range provider.All() {
+		if p.On() && !p.DecideOnly() && drawsFamily(p, id) {
+			return p, id, true
+		}
+	}
 	return provider.Resolve(id)
 }
 
-// codexDrawers are the image models a ChatGPT account draws with, at
-// its Codex backend's images API, as Codex CLI does (gpt-image-2 is the one
-// it asks for).
+// drawsFamily is whether a subscription whose image models magpie lists
+// itself (codexDrawers, grokDrawers) draws id, a model of the family those
+// are of: any grok-imagine-image* on a Grok subscription, any gpt-image-*
+// on a ChatGPT account. The vendor's newer ones work before magpie names
+// them, as grok-imagine-video* do for videos; one it doesn't serve is
+// refused by the vendor, in its own words.
+func drawsFamily(p provider.Provider, id string) bool {
+	switch {
+	case drawsGrok(p):
+		return strings.HasPrefix(id, grokDrawerFamily)
+	case drawsCodex(p):
+		return strings.HasPrefix(id, codexDrawerFamily)
+	}
+	return false
+}
+
+// The families of the image models a ChatGPT account and a Grok
+// subscription draw with (drawsFamily).
+const (
+	codexDrawerFamily = "gpt-image-"
+	grokDrawerFamily  = "grok-imagine-image"
+)
+
+// codexDrawers is the image model a ChatGPT account draws with, at its
+// Codex backend's images API, as Codex CLI does (gpt-image-2 is the one it
+// asks for). It is one: the backend picks the model itself, and answers
+// gpt-image-2, gpt-image-2.5 and a made-up name alike with the same image
+// (#1865), so listing 2.5 apart said there was a choice where there is
+// none. A gpt-image-2.5 saved when it was listed still draws there
+// (drawsFamily) and shows as this one (ListedDrawer).
 var codexDrawers = []catalog.Model{
-	{ID: "gpt-image-2", Name: "GPT Image 2", Released: "2026-01-01"},
-	{ID: "gpt-image-2.5", Name: "GPT Image 2.5", Released: "2026-06-01"},
+	{ID: "gpt-image-2", Name: "GPT Image", Released: "2026-01-01"},
+}
+
+// VendorPicksDrawer is whether p's vendor picks the image model itself,
+// whichever is named: a ChatGPT account's images backend (#1865).
+func VendorPicksDrawer(p provider.Provider) bool { return drawsCodex(p) }
+
+// ListedDrawer is the listed image model a picked one (provider/model)
+// stands for: a ChatGPT account's gpt-image-2.5, or any other GPT Image
+// name, is its one GPT Image, as its backend draws the same for any name
+// (#1865). ref itself otherwise, and when its provider isn't found. The
+// pick itself is kept as it was saved, and draws as before.
+func ListedDrawer(ref string) string {
+	pid, id, ok := strings.Cut(ref, "/")
+	if !ok || !strings.HasPrefix(id, codexDrawerFamily) || id == codexDrawer {
+		return ref
+	}
+	p, err := provider.Find(pid)
+	if err != nil || !drawsCodex(*p) {
+		return ref
+	}
+	return pid + "/" + codexDrawer
 }
 
 // codexDrawer is the image model Codex CLI asks a ChatGPT account for, the
@@ -147,8 +217,11 @@ func Drawers(p provider.Provider) []catalog.Model {
 	if p.Account != nil || (p.Base(provider.Chat) == "" && p.Base(provider.Responses) == "") {
 		return nil
 	}
-	var out []catalog.Model
-	have := map[string]bool{}
+	out := p.PlanDrawers()
+	have := make(map[string]bool, len(out))
+	for _, m := range out {
+		have[m.ID] = true
+	}
 	for _, c := range p.Catalogs() {
 		for _, m := range catalog.Drawers(c) {
 			if !have[m.ID] {
@@ -223,9 +296,12 @@ func (p picture) dataURL() string {
 // drawing is one images request, whichever shape it came in.
 type drawing struct {
 	Model, Prompt, Size, Quality, Background, Format string
-	N                                                int
-	Images                                           []picture // to edit, or draw from
-	Mask                                             *picture
+	// Want is the response_format the caller asked for: with "b64_json"
+	// an image a vendor gave only a URL for is fetched (inline)
+	Want   string
+	N      int
+	Images []picture // to edit, or draw from
+	Mask   *picture
 }
 
 // drawn is what a vendor gave back.
@@ -271,6 +347,10 @@ func (s *Server) images(edit bool) http.HandlerFunc {
 		if d.Model == "" {
 			m, ok := drawer()
 			if !ok {
+				if v := DrawerMissing(); v != "" {
+					fail(400, fmt.Sprintf("no model to draw with: the Image generation model picked in magpie's Settings, %q, isn't set up any more: pick another in Settings → Models → Image generation, or name one", v))
+					return
+				}
 				fail(400, "no model to draw with: pick one in magpie's Settings → Images → Image generation, or name one")
 				return
 			}
@@ -291,6 +371,10 @@ func (s *Server) images(edit bool) http.HandlerFunc {
 		}
 		if keyWho, held := keyHolds(r); held && named && !modelAllowed(keyWho, p, model) {
 			fail(403, keyModelError(keyWho, d.Model))
+			return
+		}
+		if msg, off := modelOff(p, model, d.Model); off { // disabled by the user (#1867)
+			fail(403, msg)
 			return
 		}
 		var unmask func()
@@ -324,8 +408,21 @@ func (s *Server) images(edit bool) http.HandlerFunc {
 			return
 		}
 		s.record(call)
+		// asked for the image itself, one the vendor keeps at a URL is
+		// fetched the way the vendor was reached: through its proxy, by
+		// the client that just had its answer (#1576: the 4K image a relay
+		// drew in 40 s was lost to generate_image's own download). One
+		// that can't be fetched is answered by its URL all the same, never
+		// dropped: it is drawn, and paid for.
 		data := make([]map[string]any, 0, len(out.Images))
 		for _, im := range out.Images {
+			if im.URL != "" && inline(d.Want) {
+				if b, mt, err := FetchImage(p.Via(r.Context()), s.client, im.URL); err == nil {
+					im = picture{Mime: mt, Data: b}
+				} else if s.debug {
+					log.Printf("images: %s's image at %s is answered by its URL: %v", p.ID, im.URL, err)
+				}
+			}
 			e := map[string]any{}
 			if im.URL != "" {
 				e["url"] = im.URL
@@ -373,7 +470,7 @@ func readDrawing(r *http.Request) (drawing, error) {
 			}
 			return ""
 		}
-		d.Model, d.Prompt, d.Size, d.Quality, d.Background, d.Format = get("model"), get("prompt"), get("size"), get("quality"), get("background"), get("output_format")
+		d.Model, d.Prompt, d.Size, d.Quality, d.Background, d.Format, d.Want = get("model"), get("prompt"), get("size"), get("quality"), get("background"), get("output_format"), get("response_format")
 		d.N, _ = strconv.Atoi(get("n"))
 		for _, k := range []string{"image", "image[]"} {
 			for _, fh := range f.File[k] {
@@ -412,7 +509,7 @@ func readDrawing(r *http.Request) (drawing, error) {
 		if err := json.Unmarshal(body, &in); err != nil {
 			return d, fmt.Errorf("the request isn't JSON: %v", err)
 		}
-		d = drawing{Model: in.Model, Prompt: in.Prompt, Size: in.Size, Quality: in.Quality, Background: in.Background, Format: in.Format, N: in.N}
+		d = drawing{Model: in.Model, Prompt: in.Prompt, Size: in.Size, Quality: in.Quality, Background: in.Background, Format: in.Format, Want: strings.TrimSpace(in.ResponseFormat), N: in.N}
 		for _, raw := range []json.RawMessage{in.Image, in.Images} {
 			for _, src := range imageSources(raw) {
 				pic, err := pictureOf(src)
@@ -553,19 +650,14 @@ func viaFor(p provider.Provider, model string) drawVia {
 // hands the request to the next, as a Plus account further down draws
 // what the pinned one may not (#545). The refusal is of images alone, so
 // no account rests for text over it. It answers with the account that
-// drew, or the last one's error when every one refused.
+// drew, or the last one's error when every one refused. A provider's keys
+// are gone over the same way (#1657): a key whose own list of models
+// leaves the image model out never draws, nor is the first key used for
+// one only another lists; with every key or account set not to serve the
+// model, it is refused with why, as a chat is.
 func (s *Server) drawOnAccounts(ctx context.Context, r *http.Request, p provider.Provider, model string, d drawing) (provider.Provider, drawn, int, time.Time, error) {
-	if p.Account == nil {
-		// a key of its own: the calling key's accounts hold it as one,
-		// drawn with a key it may use — of those in use, not the
-		// provider's first alone, which a key held to a later one was
-		// refused by — or none, refused
-		if keyWho, held := accountHolds(r); held {
-			var ok bool
-			if p, ok = allowedKey(keyWho, p, model); !ok {
-				return p, drawn{}, http.StatusForbidden, time.Time{}, errors.New(keyAccountsError(keyWho, d.Model))
-			}
-		}
+	if p.Account == nil && p.Key == "" {
+		// no key and no account (a local ollama): nothing to go over
 		out, code, err := s.draw(ctx, p, model, d)
 		return p, out, code, time.Time{}, err
 	}
@@ -576,7 +668,7 @@ func (s *Server) drawOnAccounts(ctx context.Context, r *http.Request, p provider
 	// when another's list is unknown; for drawing it is asked last
 	_, _, left, barred := perKeyBarred(q, model, provider.Chat)
 	for _, c := range left {
-		if !slices.ContainsFunc(cs, func(o candidate) bool { return accountOf(o.p) == accountOf(c.p) }) {
+		if !slices.ContainsFunc(cs, func(o candidate) bool { return o.p.AccountID() == c.p.AccountID() }) {
 			cs = append(cs, c)
 		}
 	}
@@ -594,20 +686,34 @@ func (s *Server) drawOnAccounts(ctx context.Context, r *http.Request, p provider
 		msg, back := cappedError(model, barredOf(barred, q, false, provider.Chat, nil), time.Now())
 		return p, drawn{}, http.StatusTooManyRequests, back, errors.New(msg)
 	}
+	if len(cs) == 0 && len(barred) > 0 {
+		// every key or account is set not to serve the model (#474)
+		return p, drawn{}, http.StatusForbidden, time.Time{}, errors.New(barredError(d.Model, barredOf(barred, q, false, provider.Chat, nil)))
+	}
 	if len(cs) == 0 {
 		cs = []candidate{{p: p, model: model, rest: p.ID}}
 	}
+	cs = probeOne(cs) // of those resting, only the one back soonest (#1799)
 	var out drawn
 	var code int
 	var err error
 	for i, c := range cs {
 		p = c.p
 		out, code, err = s.draw(ctx, p, model, d)
-		if err == nil || ctx.Err() != nil || i+1 == len(cs) || !accountRefusedDrawing(code) {
+		if err == nil || ctx.Err() != nil || i+1 == len(cs) || !accountRefusedDrawing(code) && !keyLacksModel(code, err) {
 			break
 		}
 	}
 	return p, out, code, time.Time{}, err
+}
+
+// keyLacksModel says a vendor answered 404 that the model isn't one this
+// key or account serves: a relay's "Model "gpt-image-2" is not supported by
+// any configured account in this group" for a key of its text models
+// alone, while the provider's next key serves it (#1657). The next is
+// asked; a bare 404, a wrong address, is the request's and asks none.
+func keyLacksModel(code int, err error) bool {
+	return code == http.StatusNotFound && err != nil && modelRefused(code, []byte(err.Error()))
 }
 
 // accountRefusedDrawing says a failure to draw was the account's — its
@@ -638,16 +744,33 @@ func (s *Server) draw(ctx context.Context, p provider.Provider, model string, d 
 	}
 	via := viaFor(p, model)
 	out, code, err := s.drawOn(ctx, p, model, d, via)
-	if err != nil && (code == 404 || code == 405) && via != viaGemini {
+	if err != nil && via != viaGemini && (code == 404 || code == 405 || pointsAway(via, code, err)) {
 		other := viaChat
 		if via == viaChat {
 			other = viaImages
 		}
-		if o, c, e := s.drawOn(ctx, p, model, d, other); e == nil {
-			return o, c, nil
+		// the vendor named the other API: its answer there is the one to
+		// tell, not the refusal that sent the request on
+		if o, c, e := s.drawOn(ctx, p, model, d, other); e == nil || pointsAway(via, code, err) {
+			return o, c, e
 		}
 	}
 	return out, code, err
+}
+
+// pointsAway is whether a vendor turned a drawing away on one API with
+// words that send it to the other: a 400 on chat completions saying "Use
+// /v1/images/generations" (Agnes, #1837), or one on the images API naming
+// chat completions. The model is then asked there, as when the API it was
+// asked on isn't served at all (404, 405).
+func pointsAway(via drawVia, code int, err error) bool {
+	if code != http.StatusBadRequest && code != http.StatusUnprocessableEntity {
+		return false
+	}
+	if via == viaChat {
+		return catalog.PointsToImagesAPI(err.Error())
+	}
+	return catalog.PointsToChat(err.Error())
 }
 
 func (s *Server) drawOn(ctx context.Context, p provider.Provider, model string, d drawing, via drawVia) (drawn, int, error) {
@@ -673,7 +796,7 @@ func (s *Server) sendAs(ctx context.Context, p provider.Provider, method, url, c
 
 // sendWith is sendAs with headers of the vendor's own besides.
 func (s *Server) sendWith(ctx context.Context, p provider.Provider, method, url, contentType string, body []byte, sign bool, extra http.Header) ([]byte, int, error) {
-	ctx = p.Via(ctx)
+	ctx = s.metered(p.Via(ctx), p, "") // counted against its MaxRPM (rpm.go)
 	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, 500, err
@@ -681,7 +804,10 @@ func (s *Server) sendWith(ctx context.Context, p provider.Provider, method, url,
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
+	// magpie's, or the agent's own where the provider passes it on (#1851)
+	stampUA(ctx, p, req.Header)
 	if p.IsRemoteMagpie() {
+		req.Header.Set("User-Agent", "magpie/"+Version)
 		passOnCaller(ctx, req)
 	}
 	if sign {
@@ -699,12 +825,13 @@ func (s *Server) sendWith(ctx context.Context, p provider.Provider, method, url,
 		// Google's API keys go in their own header
 		req.Header.Set("x-goog-api-key", p.Key)
 		for k, v := range p.Headers {
-			req.Header[k] = []string{v}
+			catalog.PutUserHeader(req.Header, k, v)
 		}
 	}
 	for k, v := range extra {
 		req.Header[k] = v
 	}
+	asked := time.Now()
 	res, err := p.Do(s.client, req) // a plugin's through the plugin
 	if err != nil {
 		if ctx.Err() != nil {
@@ -713,8 +840,15 @@ func (s *Server) sendWith(ctx context.Context, p provider.Provider, method, url,
 		return nil, 502, err
 	}
 	defer res.Body.Close()
-	b, err := io.ReadAll(io.LimitReader(res.Body, 256<<20))
+	answered := time.Since(asked)
+	rb := &tracked{r: res.Body, last: time.Now()}
+	b, err := io.ReadAll(io.LimitReader(rb, 256<<20))
 	if err != nil {
+		if ctx.Err() != nil {
+			// not a bare "context deadline exceeded" (#1576): the vendor
+			// began answering, and its answer is what ran out of time
+			return nil, 504, fmt.Errorf("%s began answering after %s (%d %s) but hadn't sent all of its answer in %s: %s", p.Name, answered.Round(time.Second), res.StatusCode, http.StatusText(res.StatusCode), drawTimeout, stalledAt(b, time.Since(rb.last)))
+		}
 		return nil, 502, err
 	}
 	if res.StatusCode >= 300 {
@@ -725,6 +859,47 @@ func (s *Server) sendWith(ctx context.Context, p provider.Provider, method, url,
 		return b, res.StatusCode, fmt.Errorf("%s: %d %s%s%s", provider.HostOf(url), res.StatusCode, http.StatusText(res.StatusCode), vendorSaid(vendorMessage(b)), hint)
 	}
 	return b, res.StatusCode, nil
+}
+
+// tracked is a body that notes when its last bytes came.
+type tracked struct {
+	r    io.Reader
+	last time.Time
+}
+
+func (t *tracked) Read(p []byte) (int, error) {
+	n, err := t.r.Read(p)
+	if n > 0 {
+		t.last = time.Now()
+	}
+	return n, err
+}
+
+// stalledAt says where an answer that didn't finish stopped (#1576): how
+// much had come, how long nothing more had, and whether the image was
+// coming as a link (so the answer itself stuck, after its start) or as
+// b64_json (so it was the image's own bytes that came too slowly). A relay
+// may answer one size with either, so the two point at different fixes.
+func stalledAt(got []byte, quiet time.Duration) string {
+	where := fmt.Sprintf("%s had come, and nothing more for the last %s", sizeOf(len(got)), quiet.Round(time.Second))
+	switch {
+	case bytes.Contains(got, []byte(`"b64_json"`)):
+		return "it was sending the image itself as b64_json; " + where
+	case bytes.Contains(got, []byte(`"url"`)):
+		return "it was answering with the image's url, not the image; " + where
+	}
+	return "what came doesn't yet say whether the image was coming as a url or as b64_json; " + where
+}
+
+// sizeOf is n bytes for a reader: 386 B, 12.4 KB, 3.0 MB.
+func sizeOf(n int) string {
+	switch {
+	case n < 1000:
+		return fmt.Sprintf("%d B", n)
+	case n < 1000*1000:
+		return fmt.Sprintf("%.1f KB", float64(n)/1000)
+	}
+	return fmt.Sprintf("%.1f MB", float64(n)/1000/1000)
 }
 
 // vendorMessage is the message of a vendor's error, or its body.
@@ -916,24 +1091,96 @@ func readImagesAnswer(p provider.Provider, url string, b []byte, code int) (draw
 // fetchPicture downloads an image an edit was given by URL, for an images
 // API that takes only files.
 func (s *Server) fetchPicture(ctx context.Context, url string) ([]byte, string, error) {
+	b, _, err := FetchImage(ctx, s.client, url)
+	if err != nil {
+		return nil, "", fmt.Errorf("couldn't fetch the image at %s: %v", url, err)
+	}
+	return b, http.DetectContentType(b), nil
+}
+
+// inline says a response_format asks for the image itself.
+func inline(format string) bool { return strings.EqualFold(format, "b64_json") }
+
+// ImageStall is how long an image being downloaded may send nothing before
+// the download is given up, and ImageLongest how long it may take in all.
+// A slow download goes on while it moves: a 4K PNG is 10 MB and more, and
+// a cap on the whole of it (generate_image's was 2 minutes) lost one that
+// was still coming (#1576).
+var (
+	ImageStall   = time.Minute
+	ImageLongest = 5 * time.Minute
+)
+
+// maxImageBytes is the most of an image a download reads.
+const maxImageBytes = 64 << 20
+
+var errImageStalled = errors.New("the download stalled")
+
+// FetchImage downloads the image at url with c: its bytes, and its type —
+// what the bytes are, over what the server says. It gives up when nothing
+// comes for ImageStall or it has taken ImageLongest, and says which, and
+// how much had come.
+func FetchImage(ctx context.Context, c *http.Client, url string) ([]byte, string, error) {
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		return nil, "", fmt.Errorf("%q isn't an http(s) URL", url)
+	}
+	ctx, cancel := context.WithTimeout(ctx, ImageLongest)
+	defer cancel()
+	ctx, stop := context.WithCancelCause(ctx)
+	defer stop(nil)
+	stall := time.AfterFunc(ImageStall, func() { stop(errImageStalled) })
+	defer stall.Stop()
+	got := 0
+	why := func(err error) error {
+		if ctx.Err() == nil {
+			return err
+		}
+		switch context.Cause(ctx) {
+		case errImageStalled:
+			return fmt.Errorf("nothing came for %s, after %s", ImageStall, mb(got))
+		case context.DeadlineExceeded:
+			return fmt.Errorf("only %s came in %s", mb(got), ImageLongest)
+		}
+		return err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, "", err
 	}
-	res, err := s.client.Do(req)
+	res, err := c.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("couldn't fetch the image at %s: %v", url, err)
+		return nil, "", why(err)
 	}
 	defer res.Body.Close()
 	if res.StatusCode >= 300 {
-		return nil, "", fmt.Errorf("couldn't fetch the image at %s: %s", url, res.Status)
+		return nil, "", errors.New(res.Status)
 	}
-	b, err := io.ReadAll(io.LimitReader(res.Body, 64<<20))
-	if err != nil {
-		return nil, "", err
+	var buf bytes.Buffer
+	chunk := make([]byte, 256<<10)
+	for {
+		stall.Reset(ImageStall)
+		n, err := res.Body.Read(chunk)
+		buf.Write(chunk[:n])
+		if got = buf.Len(); got > maxImageBytes {
+			return nil, "", fmt.Errorf("it is over %s", mb(maxImageBytes))
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, "", why(err)
+		}
 	}
-	return b, http.DetectContentType(b), nil
+	b := buf.Bytes()
+	mt, _, _ := mime.ParseMediaType(res.Header.Get("Content-Type"))
+	if sniffed := http.DetectContentType(b); strings.HasPrefix(sniffed, "image/") || !strings.HasPrefix(mt, "image/") {
+		mt = sniffed
+	}
+	return b, mt, nil
 }
+
+// mb is n bytes as people read it.
+func mb(n int) string { return fmt.Sprintf("%.1f MB", float64(n)/(1<<20)) }
 
 func extOf(mimeType string) string {
 	switch mimeType {

@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/gateway"
-	"github.com/yetone/magpie/internal/usage"
 )
 
 // sameGroup compares two values of a field, one of them read back from the
@@ -94,6 +93,11 @@ func TestDriftBypassed(t *testing.T) {
 	cx := codex(home)
 	defer func(s time.Time) { started = s }(started)
 	started = time.Now().Add(-time.Hour)
+	// a request reaching the gateway, kept to this run: usage.Saw's record
+	// lasts the process, so the next run (-count=2) would start with it
+	var saw time.Time
+	defer func(f func(string) time.Time) { lastSeen = f }(lastSeen)
+	lastSeen = func(string) time.Time { return saw }
 	if err := cx.Apply("model", "fake/m1"); err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +115,7 @@ func TestDriftBypassed(t *testing.T) {
 	if d := cx.Drift(); d == nil || d.Kind != "bypassed" || d.Want != "fake/m1" {
 		t.Fatalf("bypassed: %+v", d)
 	}
-	usage.Saw("codex")
+	saw = time.Now()
 	if d := cx.Drift(); d != nil {
 		t.Fatalf("a request arrived: %+v", d)
 	}
@@ -151,6 +155,9 @@ func TestDriftUnwiredEveryAgent(t *testing.T) {
 	// OpenHanako gives the model to an agent of its own
 	os.MkdirAll(filepath.Join(home, ".hanako", "agents", "hana"), 0o755)
 	os.WriteFile(filepath.Join(home, ".hanako", "agents", "hana", "config.yaml"), []byte("agent:\n  name: Hana\n"), 0o644)
+	// AstrBot is connected once it has written its settings
+	os.MkdirAll(filepath.Join(home, ".astrbot", "data"), 0o755)
+	os.WriteFile(filepath.Join(home, ".astrbot", "data", "cmd_config.json"), []byte(astrbotConfig), 0o644)
 	for _, a := range All() {
 		// agy's gateway is in the command that starts it, in no file (its
 		// Check is TestAgy's)

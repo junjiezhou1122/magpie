@@ -69,6 +69,13 @@ const (
 	CheckinIneligible = "ineligible" // the account can't take part
 	CheckinInactive   = "inactive"   // no event running, or it has ended
 	CheckinFailed     = "failed"     // no answer; tried again later that day
+	// CheckinCaptcha is a plugin's check-in the vendor asked a captcha
+	// of: the user checks in in its own app, magpie never solves one
+	CheckinCaptcha = "captcha"
+	// CheckinOwnApp is a check-in the vendor pays out only to its own
+	// app (Trae CN's 9074 to a device its app didn't register): an
+	// answer for the day, and the user checks in in the vendor's app
+	CheckinOwnApp = "own-app"
 )
 
 // wbCheckinSoon is how long a check-in that never reached WorkBuddy waits
@@ -96,6 +103,9 @@ type WorkBuddyCheckin struct {
 	Credit  float64   `json:"credit,omitempty"`
 	Streak  int       `json:"streak,omitempty"`
 	Msg     string    `json:"msg,omitempty"`
+	// ValidUntil is a campaign's end, when a successful answer must be
+	// checked again, even if the Beijing day hasn't changed.
+	ValidUntil time.Time `json:"until,omitzero"`
 	// Offline is a failure that never reached WorkBuddy, and Tries how
 	// many before it the same day did the same.
 	Offline bool `json:"offline,omitempty"`
@@ -103,6 +113,9 @@ type WorkBuddyCheckin struct {
 	// By is the vendor whose check-in it is: "" WorkBuddy's, "trae"
 	// Trae CN's; never kept.
 	By string `json:"by,omitempty"`
+	// Vendor is a plugin's provider by name, for a check-in By
+	// "plugin:<id>"; never kept.
+	Vendor string `json:"vendor,omitempty"`
 	// Asked is true of one checked in on this run, not one read back.
 	Asked bool `json:"-"`
 }
@@ -214,7 +227,7 @@ func wbCheckin(ctx context.Context, a wbAccount) WorkBuddyCheckin {
 	}
 	var st wbCheckinStatus
 	if err := wbCallVia(ctx, do, http.MethodPost, a.site.api()+"/v2/billing/meter/checkin-activity-status", h, map[string]any{}, &st); err != nil {
-		return wbCheckinRefused(err)
+		return wbCheckinUnauthorized(ctx, do, a, h, err)
 	}
 	switch {
 	case !st.Active:
@@ -224,13 +237,45 @@ func wbCheckin(ctx context.Context, a wbAccount) WorkBuddyCheckin {
 	}
 	var got wbCheckinClaim
 	if err := wbCallVia(ctx, do, http.MethodPost, a.site.api()+"/v2/billing/meter/daily-checkin", h, map[string]any{}, &got); err != nil {
-		r := wbCheckinRefused(err)
+		r := wbCheckinUnauthorized(ctx, do, a, h, err)
 		if r.Outcome == CheckinDone {
 			r.Streak = int(st.StreakDays)
 		}
 		return r
 	}
 	return WorkBuddyCheckin{Outcome: CheckinClaimed, Credit: float64(got.Credit), Streak: int(got.StreakDays), Msg: got.Message}
+}
+
+// wbCheckinUnauthorized is wbCheckinRefused, told apart on a 401: WorkBuddy's
+// gateway answers a token it refuses with a bare 401 (an HTML page, so the
+// card said only "Unauthorized" and "magpie tries again later", every 30
+// minutes, all day; モモコ on Discord, a Free account, signing in again
+// didn't help). The account's credits are read with the same headers at
+// once: when they read, the sign-in is good and it is the check-in alone
+// that refuses magpie — WorkBuddy's own app sends its check-in, and only
+// its check-in, with a device token from its security SDK (X-Device-Token,
+// buildHeadersWithTuringToken in WorkBuddy 5.5.6), which magpie can't make
+// — so it is an answer for the day, to check in in the WorkBuddy app. When
+// they don't read either, the sign-in itself is refused: sign in again.
+func wbCheckinUnauthorized(ctx context.Context, do func(*http.Request) (*http.Response, error), a wbAccount, h map[string]string, err error) WorkBuddyCheckin {
+	if !wbIsUnauthorized(err) {
+		return wbCheckinRefused(err)
+	}
+	if wbCallVia(ctx, do, http.MethodPost, a.site.api()+"/billing/meter/get-user-resource-summary", h, map[string]any{}, nil) == nil {
+		return WorkBuddyCheckin{Outcome: CheckinOwnApp, Msg: "WorkBuddy answered the check-in 401 Unauthorized while this account's credits read fine: its check-in takes WorkBuddy's own app"}
+	}
+	return WorkBuddyCheckin{Outcome: CheckinFailed, Msg: "WorkBuddy refused this account's sign-in (401 Unauthorized); sign in to it again"}
+}
+
+// wbIsUnauthorized says whether err is WorkBuddy's 401, bare or with a
+// message.
+func wbIsUnauthorized(err error) bool {
+	var se *accountStatusError
+	if errors.As(err, &se) {
+		return se.status == http.StatusUnauthorized
+	}
+	var we *wbError
+	return errors.As(err, &we) && we.code == http.StatusUnauthorized
 }
 
 // wbCheckinRefused is what an error from the event's API comes to: one of
@@ -292,7 +337,8 @@ func WithCheckins(qs []SubscriptionQuota) []SubscriptionQuota {
 	qs = withCheckins(qs, wbCheckinAccounts(), readCheckins(wbCheckinPath()))
 	qs = markCheckins(qs, traeCards(traeCheckinAccounts()), readCheckins(traeCheckinPath()), "trae")
 	qs = markCheckins(qs, miniMaxCards(miniMaxCheckinAccounts()), readCheckins(miniMaxCheckinPath()), "minimax")
-	return markCheckins(qs, qoderCards(qoderCheckinAccounts()), readCheckins(qoderCheckinPath()), "qoder")
+	qs = markCheckins(qs, qoderCards(qoderCheckinAccounts()), readCheckins(qoderCheckinPath()), "qoder")
+	return pluginCheckinMarks(qs)
 }
 
 func withCheckins(qs []SubscriptionQuota, accts []wbAccount, st map[string]WorkBuddyCheckin) []SubscriptionQuota {
@@ -361,13 +407,13 @@ func HasWorkBuddy() bool { return len(wbCheckinAccounts()) > 0 }
 func wbCheckinAccounts() []wbAccount {
 	if Moved(wbCN.id) {
 		pp, ok := PluginOf(wbCN.id)
-		if !ok {
+		if !ok || pluginChecksIn(pp) {
 			return nil
 		}
 		return wbPluginAccounts(pp)
 	}
 	out := wbLogins(wbCN)
-	if pp, ok := PluginOf(PluginID(wbCN.id)); ok && pp.ID == wbCN.id {
+	if pp, ok := PluginOf(PluginID(wbCN.id)); ok && pp.ID == wbCN.id && !pluginChecksIn(pp) {
 		out = append(out, wbPluginAccounts(pp)...)
 	}
 	return out

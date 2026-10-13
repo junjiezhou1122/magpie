@@ -8,8 +8,12 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 func TestNewerVersions(t *testing.T) {
@@ -51,9 +55,7 @@ func TestInstalledVersion(t *testing.T) {
 	}
 	p := filepath.Join(bin, "pi")
 	for _, c := range []struct{ out, want string }{{"0.98.2", "0.98.2"}, {"pi 0.99.0\n", "0.99.0"}} {
-		if err := os.WriteFile(p, []byte("#!/bin/sh\necho '"+c.out+"'\n"), 0o755); err != nil {
-			t.Fatal(err)
-		}
+		testenv.Program(t, p, "#!/bin/sh\necho '"+c.out+"'\n")
 		if v := a.InstalledVersion(); v != c.want {
 			t.Errorf("%q: %q", c.out, v)
 		}
@@ -87,7 +89,9 @@ func file(t *testing.T, path, body string) string {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+	if strings.HasPrefix(body, "#!") {
+		testenv.Program(t, path, body)
+	} else if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	return path
@@ -319,5 +323,148 @@ func TestUpdateCLI(t *testing.T) {
 	}
 	if _, ok := (&Agent{ID: "codex", Bin: "codex", WSL: "Ubuntu"}).CLI(); ok {
 		t.Error("a WSL codex has a CLI here")
+	}
+}
+
+// An agent's CLI installed with bun is updated by bun add -g, which can't
+// use a SOCKS5 proxy (#1409): it is given the bridge in front of it. npm,
+// which can, is given the proxy as it is.
+func TestUpdateWithBunBridgesSOCKS(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	const socks = "socks5://127.0.0.1:4401"
+	names := []string{"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"}
+	for _, k := range names {
+		t.Setenv(k, socks)
+	}
+	// the proxy URLs only: NO_PROXY's hosts or Node's NODE_USE_ENV_PROXY=1,
+	// set on the machine running the test, name no proxy
+	proxies := func(env []string) []string {
+		var out []string
+		for _, kv := range env {
+			if k, v, _ := strings.Cut(kv, "="); slices.Contains(names, k) && v != "" {
+				out = append(out, v)
+			}
+		}
+		return out
+	}
+	bun := proxies(updateEnv(&updater{via: "bun", cmd: []string{"bun", "add", "-g", "x@latest"}}))
+	if len(bun) == 0 {
+		t.Fatal("bun is given no proxy")
+	}
+	for _, v := range bun {
+		if !strings.HasPrefix(v, "http://127.0.0.1:") {
+			t.Fatalf("bun is given %s", v)
+		}
+	}
+	for _, v := range proxies(updateEnv(&updater{via: "npm", cmd: []string{"npm", "i", "-g", "x@latest"}})) {
+		if v != socks {
+			t.Fatalf("npm is given %s", v)
+		}
+	}
+}
+
+// Grok Build from xAI's installer (xiaoxiaofeixz on Discord: Grok at
+// C:\Users\<user>\.grok\bin\grok.exe showed no newest version and no
+// update): install.sh's ~/.grok/bin/grok links to
+// ../downloads/grok-<platform>, which grok update replaces with
+// ../downloads/grok-<version>-<platform>; install.ps1 copies grok.exe into
+// ~\.grok\bin, and grok update copies the new one over it. The CLI is read
+// from there, not PATH, where grok may be Homebrew's regular-expression tool.
+func TestGrokInstalled(t *testing.T) {
+	home, _ := filepath.EvalSymlinks(t.TempDir())
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("GROK_HOME", "")
+	other := t.TempDir() // another grok on PATH
+	file(t, filepath.Join(other, exe("grok")), "MZ")
+	t.Setenv("PATH", other)
+
+	a := &Agent{ID: "grok", Name: "Grok Build"} // no Bin, as grok(home)
+	if _, ok := a.CLI(); ok {
+		t.Fatal("PATH's grok taken for Grok Build")
+	}
+
+	platform := "macos-aarch64"
+	if runtime.GOOS == "windows" {
+		platform = "windows-x86_64"
+	}
+	when := time.Date(2026, 10, 2, 9, 32, 0, 0, time.UTC)
+	// install puts the release at the path the CLI is run by; the same bytes
+	// and time for every release, as nothing but the path need tell them apart
+	var bin string
+	install := func(version string) {
+		t.Helper()
+		if runtime.GOOS == "windows" {
+			bin = filepath.Join(home, `.grok\bin\grok.exe`)
+			os.Remove(bin)
+			file(t, bin, "MZ")
+			os.Chtimes(bin, when, when)
+			return
+		}
+		name := "grok-" + platform
+		if version != "" {
+			name = "grok-" + version + "-" + platform
+		}
+		os.Chtimes(file(t, filepath.Join(home, ".grok/downloads", name), "MZ"), when, when)
+		bin = filepath.Join(home, ".grok/bin/grok")
+		os.Remove(bin)
+		link(t, "../downloads/"+name, bin)
+	}
+	install("")
+
+	served := map[string]string{"/stable": "1.0.50\n", "/alpha": "1.0.51-alpha.2\n"}
+	rel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		v, ok := served[r.URL.Path]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte(v))
+	}))
+	defer rel.Close()
+	says := "grok 1.0.46 (2765805b9442)"
+	oldRel, oldVer, oldRun := grokReleases, runVersion, runUpdate
+	grokReleases = []string{rel.URL + "/"}
+	runVersion = func(string) string { return says }
+	versions, latests = memo{}, memo{}
+	var ran [][]string
+	runUpdate = func(_ context.Context, u *updater) ([]byte, error) {
+		ran = append(ran, u.cmd)
+		install("1.0.50")
+		says = "grok 1.0.50 (c58f321264ba)"
+		return []byte("✓ grok v1.0.50 installed successfully!"), nil
+	}
+	t.Cleanup(func() {
+		grokReleases, runVersion, runUpdate = oldRel, oldVer, oldRun
+		versions, latests = memo{}, memo{}
+	})
+
+	c, ok := a.CLI()
+	if !ok || c.Version != "1.0.46" || c.Latest != "1.0.50" || !c.Update || c.Via != "self" || c.Command != exe("grok")+" update" {
+		t.Fatalf("before: %+v %v", c, ok)
+	}
+	if c, err := a.UpdateCLI(); err != nil || c.Version != "1.0.50" || c.Update {
+		t.Fatalf("after: %+v, %v", c, err)
+	}
+	if len(ran) != 1 || !reflect.DeepEqual(ran[0], []string{bin, "update"}) {
+		t.Errorf("ran %q", ran)
+	}
+
+	// grok's own update at launch (auto_update), not through magpie: the
+	// version is asked again
+	install("1.0.51")
+	says = "grok 1.0.51 (0a1b2c3d4e5f)"
+	if runtime.GOOS == "windows" {
+		later := when.Add(time.Hour) // the copy of a new download
+		os.Chtimes(bin, later, later)
+	}
+	if v := a.InstalledVersion(); v != "1.0.51" {
+		t.Errorf("after grok's own update: %q", v)
+	}
+
+	// on the alpha channel (grok update --alpha), the newest is alpha's
+	file(t, filepath.Join(home, ".grok", "config.toml"), "[cli]\ninstaller = \"internal\"\nchannel = \"alpha\"\n")
+	if c, _ := a.CLI(); c.Latest != "1.0.51-alpha.2" {
+		t.Errorf("alpha: %+v", c)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // fakeWarmClaude is a claude that writes what it was run with to log and
@@ -27,9 +28,7 @@ func fakeWarmClaude(t *testing.T, out string, code int) string {
 		"echo \"traffic:$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\"; echo \"telemetry:$DISABLE_TELEMETRY\"; " +
 		"echo \"errors:$DISABLE_ERROR_REPORTING\"; echo \"updater:$DISABLE_AUTOUPDATER\"; } > " + log + "\n" +
 		"echo '" + out + "'\nexit " + string(rune('0'+code)) + "\n"
-	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testenv.Program(t, filepath.Join(dir, "claude"), script)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:3425")
 	return log
@@ -108,12 +107,10 @@ func TestClaudeUsageRunsClaudeCode(t *testing.T) {
 	script := "#!/bin/sh\n" +
 		"{ printf 'args:'; for a in \"$@\"; do printf '[%s]' \"$a\"; done; echo; echo \"token:$CLAUDE_CODE_OAUTH_TOKEN\"; } > " + log + "\n" +
 		"cat " + out + "\n"
-	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	testenv.Program(t, filepath.Join(dir, "claude"), script)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "leaked")
-	got, err := claudeUsage(context.Background())
+	got, err := claudeUsage(context.Background(), "")
 	if err != nil || got != text {
 		t.Fatalf("usage %q %v", got, err)
 	}
@@ -133,7 +130,7 @@ func TestClaudeUsageSendsItsRequest(t *testing.T) {
 	for _, k := range []string{"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY", "DISABLE_ERROR_REPORTING", "DISABLE_AUTOUPDATER"} {
 		t.Setenv(k, "")
 	}
-	if _, err := claudeUsage(context.Background()); err != nil {
+	if _, err := claudeUsage(context.Background(), ""); err != nil {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(log)
@@ -149,11 +146,31 @@ func TestClaudeUsageSendsItsRequest(t *testing.T) {
 		t.Errorf("warm-up lacks CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:\n%s", b)
 	}
 	t.Setenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
-	if _, err := claudeUsage(context.Background()); err != nil {
+	if _, err := claudeUsage(context.Background(), ""); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(log); !strings.Contains(string(b), "traffic:1\n") {
 		t.Errorf("/usage run dropped the user's CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:\n%s", b)
+	}
+}
+
+func TestClaudeUsageRunsInSavedAccountDirectory(t *testing.T) {
+	log := fakeWarmClaude(t, `{"type":"result","is_error":false,"result":"Current session: 17% used"}`, 0)
+	t.Setenv("CLAUDE_CONFIG_DIR", "/the/users/own")
+	t.Setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/another/account")
+	got, err := claudeUsage(context.Background(), "/saved/account")
+	if err != nil || got != "Current session: 17% used" {
+		t.Fatalf("usage %q %v", got, err)
+	}
+	b, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "dir:/saved/account\n") || !strings.Contains(string(b), "[-p][/usage]") {
+		t.Fatalf("saved account's /usage ran in the wrong directory:\n%s", b)
+	}
+	if os.Getenv("CLAUDE_CONFIG_DIR") != "/the/users/own" || os.Getenv("CLAUDE_SECURESTORAGE_CONFIG_DIR") != "/another/account" {
+		t.Fatal("reading saved usage changed the caller's account directory")
 	}
 }
 
@@ -168,7 +185,7 @@ func TestClaudeVerboseOutput(t *testing.T) {
 		{"type": "result", "subtype": "success", "is_error": false, "result": text},
 	})
 	fakeWarmClaude(t, string(b), 0)
-	got, err := claudeUsage(context.Background())
+	got, err := claudeUsage(context.Background(), "")
 	if err != nil || got != text {
 		t.Fatalf("usage %q %v", got, err)
 	}

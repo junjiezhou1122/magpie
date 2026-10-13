@@ -7,7 +7,13 @@ import (
 	"testing"
 
 	"github.com/yetone/magpie/internal/agentenv"
+	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/testenv"
 )
+
+// standInsEnv names the folder of a test binary's stand-in CLIs, for a
+// test binary it starts again.
+const standInsEnv = "MAGPIE_GATEWAY_TEST_STAND_INS"
 
 func TestMain(m *testing.M) {
 	code, err := isolatedTests(m)
@@ -39,20 +45,48 @@ func isolatedTests(m *testing.M) (int, error) {
 			return 1, err
 		}
 	}
+	// The package isolates itself rather than through testenv.Run, so it
+	// says so as testenv does: what reads the marker (a CLI identity kept
+	// on disk, provider.keepsIdentities; the machine's own folders,
+	// proc.SystemDirs) then acts as in any isolated test binary. Without it
+	// an ask still going when its test ended wrote cli-identity.json into
+	// the next test's folder as that was removed (#1524, again after
+	// 9c377231 dropped this package's own switch).
+	if err := os.Setenv(testenv.Marker, home); err != nil {
+		return 1, err
+	}
 	for _, name := range agentenv.Vars {
 		if err := os.Unsetenv(name); err != nil {
 			return 1, err
 		}
 	}
-	bin := filepath.Join(home, "bin")
-	if err := os.Mkdir(bin, 0o755); err != nil {
-		return 1, err
-	}
+	// The machine's proxy variables too: net/http freezes them into its
+	// first routed request, so a test that sets its own afterwards (search's
+	// Auto, by ALL_PROXY alone) reads the machine's instead, and its
+	// searcher goes out through a proxy that cannot reach the test's
+	// servers.
+	testenv.ClearProxy()
+	// The fakes of ChatGPT's backend read turns plain; codex_zstd_test's
+	// send them zstd, as the real one is sent.
+	provider.CodexZstdForTests(false)
 	// Finding an inert CLI also prevents discovery from falling back to
 	// one installed at an absolute system path. Tests can prepend their
 	// own fakes, as fakeClaude does, and still use ordinary shell tools.
-	for _, name := range []string{"security", "secret-tool", "claude", "codex", "cursor-agent", "devin", "grok", "kiro-cli"} {
-		if err := os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+	// A test binary this one starts again (the cold-start redaction tests)
+	// runs the stand-ins its parent made: on macOS a newly written program
+	// waits for the system's first-run check, and under a full suite's load
+	// a child's account discovery spent its whole 20s on new stand-ins.
+	bin := os.Getenv(standInsEnv)
+	if bin == "" {
+		bin = filepath.Join(home, "bin")
+		if err := os.Mkdir(bin, 0o755); err != nil {
+			return 1, err
+		}
+		if err := testenv.StandIns(bin, []string{"security", "secret-tool", "claude", "codex", "cursor-agent", "devin", "grok", "kiro-cli"}); err != nil {
+			return 1, err
+		}
+		defer testenv.RemovePrograms()
+		if err := os.Setenv(standInsEnv, bin); err != nil {
 			return 1, err
 		}
 	}
@@ -62,5 +96,17 @@ func isolatedTests(m *testing.M) (int, error) {
 	// no route is written to disk behind a test's back; the history's own
 	// tests call saveRoute themselves
 	keepRoutes = false
+	// no test asks a vendor: a provider with a real base URL and a made-up
+	// key would, in the background (a plan key's windows, #1016), and a
+	// plugin host's first start fetched models.dev
+	testenv.Offline()
 	return m.Run(), nil
+}
+
+// The package's tests run as an isolated test binary: nothing the marker
+// turns off (a CLI identity kept on disk, #1524) runs behind a test's back.
+func TestRunsAsAnIsolatedTestBinary(t *testing.T) {
+	if os.Getenv(testenv.Marker) == "" {
+		t.Fatalf("TestMain left %s unset", testenv.Marker)
+	}
 }
