@@ -202,10 +202,133 @@ func Fetch(ctx context.Context, base, key string, anthropic bool, headers map[st
 // under it is its own list. When no URL answers, the error names each one
 // asked and what it said.
 func FetchAt(ctx context.Context, base, key string, anthropic bool, headers map[string]string) ([]Model, string, error) {
+	return FetchAtListed(ctx, base, key, anthropic, headers, nil)
+}
+
+// ErrAsked is what FetchAtListed says when every list URL of the base was
+// already asked for this key and none of them answered: there is nothing
+// left to ask there, which is not a refusal of the base and is not
+// reported as one to the user. A caller asking several bases of one
+// provider reads it as "this base said nothing new" and moves on.
+var ErrAsked = errors.New("every list of this base was already asked for this key")
+
+// FetchAtListed is FetchAt over a provider's several bases, and over
+// what one of them has already asked. listed is the record of this key's
+// requests so far (NewListed), and the key of a request is the list URL
+// it is made at and the authentication it is made with — Bearer, or the
+// Anthropic version header with it.
+//
+// Two rules follow, and both are what make a multi-protocol vendor's
+// models findable without asking its list twice (#1006). A list URL this
+// key has already listed is not asked again, by any protocol: the answer
+// is the answer, so a …/v1 base and the bare host beside it that speaks
+// Anthropic are one /v1/models, fetched once. And a request already made
+// is not made again — but a URL refused under one authentication is not
+// refused under the next, so the Gemini list of a base whose Chat request
+// was answered 401 is asked, with x-goog-api-key, instead of being taken
+// for a list already had.
+func FetchAtListed(ctx context.Context, base, key string, anthropic bool, headers map[string]string, listed *Listed) ([]Model, string, error) {
 	base = strings.TrimRight(strings.TrimSpace(base), "/")
 	if base == "" {
 		return nil, "", errors.New("no base URL")
 	}
+	all := listURLs(base, anthropic)
+	for _, u := range all {
+		if ms, ok := listed.listed(u); ok {
+			return ms, u, nil
+		}
+	}
+	auth := listAuthFor(anthropic)
+	var urls []string
+	for _, u := range all {
+		if !listed.asked(auth, u) {
+			urls = append(urls, u)
+		}
+	}
+	if len(urls) == 0 {
+		return nil, "", fmt.Errorf("%s: no model list: %w", base, ErrAsked)
+	}
+
+	var errs []string
+	for _, u := range urls {
+		ms, err := fetchOne(ctx, u, key, anthropic, headers)
+		listed.record(auth, u, ms)
+		if err == nil && len(ms) > 0 {
+			return ms, u, nil
+		}
+		if err == nil {
+			err = errors.New(u + ": no models listed")
+		}
+		errs = append(errs, err.Error())
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return nil, "", errors.New("no model list: " + strings.Join(errs, "; "))
+}
+
+// listAuthFor names how a list request is authenticated, which is half of
+// what makes it the request it is: Chat and Responses both send Bearer,
+// an Anthropic base sends the Anthropic version header as well.
+func listAuthFor(anthropic bool) string {
+	if anthropic {
+		return "anthropic"
+	}
+	return "bearer"
+}
+
+// Listed is what one fetch of a provider has asked for one key: every
+// list URL it asked at, under the authentication it asked it with, and
+// the models of the ones that answered. A caller asking several bases of
+// one provider passes the same Listed to each of them (FetchAtListed), so
+// no list is fetched twice and no request is made twice.
+type Listed struct {
+	askedAt map[string]map[string]bool // authentication -> list URL -> asked
+	lists   map[string][]Model         // list URL -> the models it listed
+}
+
+// NewListed is an empty record of one fetch's model list requests.
+func NewListed() *Listed {
+	return &Listed{askedAt: map[string]map[string]bool{}, lists: map[string][]Model{}}
+}
+
+// asked reports whether the list at u has already been asked with this
+// authentication for this key. A nil Listed asks nothing and records
+// nothing, so a caller that keeps no record pays for every URL as before.
+func (l *Listed) asked(auth, u string) bool {
+	if l == nil {
+		return false
+	}
+	return l.askedAt[auth][u]
+}
+
+// record notes a request made at u with this authentication, and the
+// models it answered with, if it answered with any.
+func (l *Listed) record(auth, u string, ms []Model) {
+	if l == nil {
+		return
+	}
+	if l.askedAt[auth] == nil {
+		l.askedAt[auth] = map[string]bool{}
+	}
+	l.askedAt[auth][u] = true
+	if len(ms) > 0 {
+		l.lists[u] = ms
+	}
+}
+
+// listed is what the list at u answered with, if it answered.
+func (l *Listed) listed(u string) ([]Model, bool) {
+	if l == nil {
+		return nil, false
+	}
+	ms, ok := l.lists[u]
+	return ms, ok
+}
+
+// listURLs is the list URLs a base is asked at, in the order they are
+// asked (FetchAtListed).
+func listURLs(base string, anthropic bool) []string {
 	var urls []string
 	add := func(u string) {
 		for _, x := range urls {
@@ -227,22 +350,7 @@ func FetchAt(ctx context.Context, base, key string, anthropic bool, headers map[
 		add(root + "/v1/models")
 		add(root + "/models")
 	}
-
-	var errs []string
-	for _, u := range urls {
-		ms, err := fetchOne(ctx, u, key, anthropic, headers)
-		if err == nil && len(ms) > 0 {
-			return ms, u, nil
-		}
-		if err == nil {
-			err = errors.New(u + ": no models listed")
-		}
-		errs = append(errs, err.Error())
-		if ctx.Err() != nil {
-			break
-		}
-	}
-	return nil, "", errors.New("no model list: " + strings.Join(errs, "; "))
+	return urls
 }
 
 // Versioned reports whether an API base URL has a version in its path — a

@@ -3,6 +3,7 @@ package provider
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -518,8 +519,16 @@ func (p Provider) fetchOne(ctx context.Context) (fetched, error) {
 	var base string
 	var sides []side  // the bases that answered, in the order asked
 	var dead []string // the bases that could not be asked this time
+	// the bases this fetch reached, whether or not their list was one
+	// another base of the same provider had already listed (#1006):
+	// the dedup is by the URL a list answered at and how it was asked,
+	// which is catalog.FetchAtListed's, and a base string is not a list
 	asked := map[string]bool{}
 	answered := map[string]bool{} // of the bases that answered, not those kept from
+	got := map[string]bool{}      // of the list URLs merged in, by the URL each answered at
+	// the lists already fetched for this key, by the URL each answered at:
+	// two of the provider's bases that are one list are one request (#1006)
+	listed := catalog.NewListed()
 	for _, proto := range p.Speaks() {
 		protoBase := p.Base(proto)
 		if proto == Gemini {
@@ -564,22 +573,29 @@ func (p Provider) fetchOne(ctx context.Context) (fetched, error) {
 		if proto == Anthropic && p.skipOpenRouterAnthropic(protoBase) {
 			continue
 		}
-		// Chat and Responses at one base say the same thing
-		if asked[protoBase] {
-			continue
-		}
 		asked[protoBase] = true
-		ms, u, err := catalog.FetchAt(lctx, protoBase, p.Key, proto == Anthropic, p.listHeaders())
+		ms, u, err := catalog.FetchAtListed(lctx, protoBase, p.Key, proto == Anthropic, p.listHeaders(), listed)
 		if err == nil && proto == Anthropic && HostOf(protoBase) == openRouterHost {
 			// the pages of the list are followed to its end, and what
 			// comes back is still not a list of models to serve
 			err = openRouterNamespacedErr(protoBase)
 		}
 		if err != nil {
+			if errors.Is(err, catalog.ErrAsked) {
+				// every list this base would ask was asked already, and
+				// none of them answered: the base says nothing new, which
+				// is not a refusal of it and is not reported as one
+				continue
+			}
 			if !slices.Contains(errs, err.Error()) {
 				errs = append(errs, err.Error())
 			}
 			dead = append(dead, protoBase)
+			continue
+		}
+		if got[u] {
+			// one list, already asked and merged under another base's
+			// spelling of the same URL: not a second endpoint (#1006)
 			continue
 		}
 		sideBase := protoBase
@@ -596,6 +612,7 @@ func (p Provider) fetchOne(ctx context.Context) (fetched, error) {
 		}
 		sides = append(sides, side{sideBase, ms})
 		answered[sideBase] = true
+		got[u] = true
 		for _, m := range ms {
 			add(m)
 		}
